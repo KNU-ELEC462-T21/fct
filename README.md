@@ -11,7 +11,6 @@ On Ubuntu 24.04, run `make init` to install GCC and clang-format using
 
 The default port is 9000 and the default receive directory is the current
 directory. The command-line interface and module headers are scaffolding:
-file transfer, file I/O, and network operations are not implemented yet.
-The protocol's integer byte order must be agreed on before implementing the
-transport. Chunk reception also needs a capacity-aware interface before it can
-safely accept untrusted payload lengths.
+file transfer and file I/O are not implemented yet. The network module uses
+big-endian protocol fields and rejects chunk payloads larger than the supplied
+buffer. Run `make test` to exercise the network module.
