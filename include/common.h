@@ -8,6 +8,38 @@
 #define DEFAULT_CHUNK_SZ (2 * 1024 * 1024)
 #define FCT_DEFAULT_PORT 9000
 
+#define FCT_MAX_DATA_WORKERS 8
+#define FCT_CHUNK_FLAG_COMPRESSED UINT32_C(1)
+#define FCT_TRANSFER_TOKEN_SIZE 16
+#define FCT_CONTROL_FRAME_WIRE_SIZE 24
+
+typedef enum {
+    FCT_CONTROL_HELLO = 1,
+    FCT_CONTROL_READY = 2,
+    FCT_CONTROL_DATA = 3,
+    FCT_CONTROL_RESULT = 4,
+} fct_control_type_t;
+
+typedef enum {
+    FCT_RESULT_OK = 0,
+    FCT_RESULT_PROTOCOL_ERROR = 1,
+    FCT_RESULT_STORAGE_ERROR = 2,
+    FCT_RESULT_TRANSFER_ERROR = 3,
+} fct_result_t;
+
+/* Host-order fields in wire order. Use FCT_MAGIC for magic and serialize
+ * integers explicitly as big-endian.
+ * HELLO and READY carry the actual worker count in arg. DATA carries a
+ * zero-based connection index. RESULT carries an fct_result_t value.
+ * Use an all-zero token in HELLO and pre-READY errors, and the token issued
+ * in READY for DATA and subsequent RESULT frames. */
+typedef struct {
+    uint32_t magic;
+    uint16_t type;
+    uint16_t arg;
+    uint8_t token[FCT_TRANSFER_TOKEN_SIZE];
+} fct_control_frame_t;
+
 /* Wire integers use big-endian byte order; filenames occupy exactly 256 bytes.
  * Metadata is 276 bytes and chunk headers are 24 bytes on the wire. */
 #pragma pack(push, 1)
@@ -23,8 +55,8 @@ typedef struct {
     uint32_t magic;
     uint32_t chunk_id;
     uint64_t offset;
-    uint32_t payload_len;
-    uint32_t flags;
+    uint32_t payload_len; /* Bytes on the wire. Derive the raw length from metadata. */
+    uint32_t flags;       /* Zero for raw data, FCT_CHUNK_FLAG_COMPRESSED for zlib data. */
 } fct_chunk_header_t;
 #pragma pack(pop)
 
