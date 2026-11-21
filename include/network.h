@@ -1,6 +1,7 @@
 #ifndef NETWORK_H
 #define NETWORK_H
 #include <stdint.h>
+#include <time.h>
 
 #include "common.h"
 
@@ -24,6 +25,29 @@ int fct_channel_send_chunk(fct_channel_t* ch, const fct_chunk_header_t* hdr, con
  * A zero-length payload may use NULL and capacity zero. */
 int fct_channel_recv_chunk(fct_channel_t* ch, fct_chunk_header_t* out_hdr, void* payload_buf,
                            size_t payload_capacity);
+
+/* These calls take an absolute CLOCK_MONOTONIC deadline. They return 0 on
+ * success and -1 with errno set on failure, including ETIMEDOUT at the deadline. */
+int fct_channel_connect_until(fct_channel_t* ch, const char* server_ip, int port,
+                              const struct timespec* deadline);
+int fct_channel_accept_until(fct_channel_t* ch, int listen_fd, const struct timespec* deadline);
+int fct_channel_send_control_until(fct_channel_t* ch, const fct_control_frame_t* frame,
+                                   const struct timespec* deadline);
+int fct_channel_recv_control_until(fct_channel_t* ch, fct_control_frame_t* frame,
+                                   const struct timespec* deadline);
+int fct_channel_send_meta_until(fct_channel_t* ch, const fct_file_meta_t* meta,
+                                const struct timespec* deadline);
+int fct_channel_recv_meta_until(fct_channel_t* ch, fct_file_meta_t* meta,
+                                const struct timespec* deadline);
+
+/* The idle timeout covers the header and payload. Only bytes transferred
+ * reset it. Return 0 on success or -1 with errno set. The receive call also
+ * returns 1 for EOF before the next header and -1/EPROTO for a truncated frame. */
+int fct_channel_send_chunk_idle(fct_channel_t* ch, const fct_chunk_header_t* hdr,
+                                const void* payload, unsigned idle_timeout_ms);
+int fct_channel_recv_chunk_idle(fct_channel_t* ch, fct_chunk_header_t* hdr, void* payload,
+                                size_t capacity, unsigned idle_timeout_ms);
+
 /* Close only a channel initialized by connect/accept or with sockfd set to -1.
  */
 void fct_channel_close(fct_channel_t* ch);
