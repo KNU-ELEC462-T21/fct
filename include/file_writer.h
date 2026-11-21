@@ -9,7 +9,6 @@ typedef struct {
     uint64_t file_size;
     uint32_t chunk_size;
     uint32_t total_chunks;
-    char filepath[512];
 } file_writer_t;
 
 /* Initialize an inactive writer. On success, replace filepath with a

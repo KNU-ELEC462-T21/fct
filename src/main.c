@@ -97,6 +97,18 @@ cleanup:
     return result;
 }
 
+static char* join_path(const char* directory, const char* name) {
+    size_t directory_length = strlen(directory);
+    size_t name_size = strlen(name) + 1;
+    char* path = malloc(directory_length + 1 + name_size);
+    if (!path)
+        return NULL;
+    memcpy(path, directory, directory_length);
+    path[directory_length] = '/';
+    memcpy(path + directory_length + 1, name, name_size);
+    return path;
+}
+
 static int receive_file(fct_channel_t* channel, const char* directory) {
     fct_file_meta_t meta;
     if (fct_channel_recv_meta(channel, &meta) < 0)
@@ -113,32 +125,34 @@ static int receive_file(fct_channel_t* channel, const char* directory) {
     }
 
     file_writer_t writer = {.fd = -1};
-    char destination[sizeof(writer.filepath)];
-    char temporary_dir[sizeof(writer.filepath)];
-    char temporary_file[sizeof(writer.filepath)];
-    int dir_length = snprintf(temporary_dir, sizeof(temporary_dir), "%s/.fct-XXXXXX", directory);
-    int destination_length =
-        snprintf(destination, sizeof(destination), "%s/%s", directory, meta.filename);
-    if (destination_length < 0 || (size_t)destination_length >= sizeof(destination) ||
-        dir_length < 0 || (size_t)dir_length + sizeof("/data") > sizeof(temporary_file)) {
-        errno = ENAMETOOLONG;
+    char* destination = join_path(directory, meta.filename);
+    if (!destination)
         return -1;
-    }
-    if (!mkdtemp(temporary_dir))
-        return -1;
-    memcpy(temporary_file, temporary_dir, (size_t)dir_length);
-    memcpy(temporary_file + dir_length, "/data", sizeof("/data"));
-
+    char* temporary_dir = join_path(directory, ".fct-XXXXXX");
+    char* temporary_file = NULL;
+    char* created_dir = temporary_dir ? mkdtemp(temporary_dir) : NULL;
     int result = -1;
-    if (fw_init(&writer, temporary_file, meta.file_size, meta.chunk_size) == 0 &&
+    int saved;
+    if (!created_dir)
+        goto cleanup;
+
+    temporary_file = join_path(temporary_dir, "data");
+    if (temporary_file &&
+        fw_init(&writer, temporary_file, meta.file_size, meta.chunk_size) == 0 &&
         receive_chunks(channel, &writer) == 0 && fsync(writer.fd) == 0) {
         /* Publish only a complete file and preserve any existing destination. */
         result = link(temporary_file, destination);
     }
-    int saved = errno;
+cleanup:
+    saved = errno;
     fw_close(&writer);
-    unlink(temporary_file);
-    rmdir(temporary_dir);
+    if (temporary_file)
+        unlink(temporary_file);
+    if (created_dir)
+        rmdir(created_dir);
+    free(temporary_file);
+    free(temporary_dir);
+    free(destination);
     errno = saved;
     return result;
 }

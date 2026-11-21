@@ -21,7 +21,8 @@ int fr_init(file_reader_t* reader, const char* filepath, uint32_t chunk_size) {
     reader->chunk_size = chunk_size;
     reader->total_chunks = 0;
 
-    fd = open(filepath, O_RDONLY);
+    /* A FIFO must reach the file type check without waiting for a writer. */
+    fd = open(filepath, O_RDONLY | O_NONBLOCK);
     if (fd < 0)
         return -1;
 

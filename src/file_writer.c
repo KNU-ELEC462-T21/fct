@@ -22,11 +22,6 @@ int fw_init(file_writer_t* writer, const char* filepath, uint64_t total_size, ui
         return -1;
     }
 
-    if (strlen(filepath) >= sizeof(writer->filepath)) {
-        errno = ENAMETOOLONG;
-        return -1;
-    }
-
     uint64_t chunks = total_size / chunk_size + (total_size % chunk_size != 0);
 
     if (total_size > INT64_MAX || chunks > UINT32_MAX) {
@@ -35,15 +30,22 @@ int fw_init(file_writer_t* writer, const char* filepath, uint64_t total_size, ui
     }
 
     /* Allocate in the same directory so the final rename is atomic. */
-    char temporary[sizeof(writer->filepath) + sizeof(".fct-XXXXXX")];
+    static const char template[] = ".fct-XXXXXX";
     const char* slash = strrchr(filepath, '/');
     size_t prefix = slash ? (size_t)(slash - filepath) + 1 : 0;
+    char* temporary = malloc(prefix + sizeof(template));
+    if (!temporary)
+        return -1;
     memcpy(temporary, filepath, prefix);
-    memcpy(temporary + prefix, ".fct-XXXXXX", sizeof(".fct-XXXXXX"));
+    memcpy(temporary + prefix, template, sizeof(template));
     int fd = mkstemp(temporary);
 
-    if (fd == -1)
+    if (fd == -1) {
+        int saved = errno;
+        free(temporary);
+        errno = saved;
         return -1;
+    }
 
     /* Reserve disk space for non-empty output files. */
     int err = total_size ? posix_fallocate(fd, 0, (off_t)total_size) : 0;
@@ -52,15 +54,16 @@ int fw_init(file_writer_t* writer, const char* filepath, uint64_t total_size, ui
     if (err != 0) {
         close(fd);
         unlink(temporary);
+        free(temporary);
         errno = err;
         return -1;
     }
+    free(temporary);
 
     writer->fd = fd;
     writer->file_size = total_size;
     writer->chunk_size = chunk_size;
     writer->total_chunks = (uint32_t)chunks;
-    strcpy(writer->filepath, filepath);
 
     return 0;
 }
