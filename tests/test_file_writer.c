@@ -1,14 +1,24 @@
+#define _POSIX_C_SOURCE 200809L
+
 #include "file_writer.h"
 #include <assert.h>
+#include <fcntl.h>
+#include <signal.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
+#include <sys/resource.h>
 #include <unistd.h>
 
 int main(void)
 {
     file_writer_t writer;
+    char directory[] = "/tmp/fct-writer-test-XXXXXX";
+    char path[sizeof(directory) + sizeof("/output.bin")];
 
-    assert(fw_init(&writer, "test_output.bin", 10, 4) == 0);
+    assert(mkdtemp(directory) != NULL);
+    snprintf(path, sizeof(path), "%s/output.bin", directory);
+    assert(fw_init(&writer, path, 10, 4) == 0);
 
     /* Write chunks out of order. */
     assert(fw_write_chunk(&writer, 2, "IJ", 2) == 2);
@@ -22,16 +32,46 @@ int main(void)
 
     fw_close(&writer);
 
+    /* Force allocation to fail after the temporary file has been opened. */
+    struct rlimit original_limit, limited;
+    assert(getrlimit(RLIMIT_FSIZE, &original_limit) == 0);
+    limited = original_limit;
+    limited.rlim_cur = 0;
+    void (*previous_handler)(int) = signal(SIGXFSZ, SIG_IGN);
+    assert(previous_handler != SIG_ERR);
+    assert(setrlimit(RLIMIT_FSIZE, &limited) == 0);
+    assert(fw_init(&writer, path, 10, 4) == -1);
+    assert(setrlimit(RLIMIT_FSIZE, &original_limit) == 0);
+    assert(signal(SIGXFSZ, previous_handler) != SIG_ERR);
+    fw_close(&writer);
+
     /* Verify output file. */
-    FILE *fp = fopen("test_output.bin", "rb");
+    FILE *fp = fopen(path, "rb");
     assert(fp != NULL);
 
     char buf[11] = {0};
     assert(fread(buf, 1, 10, fp) == 10);
     assert(strcmp(buf, "ABCDEFGHIJ") == 0);
 
-    fclose(fp);
-    unlink("test_output.bin");
+    /* Cleanup after either validation or open failure must leave other fds open. */
+    int unrelated = fileno(fp);
+    writer.fd = unrelated;
+    assert(fw_init(&writer, path, 10, 0) == -1);
+    assert(writer.fd == -1);
+    fw_close(&writer);
+    assert(fcntl(unrelated, F_GETFD) >= 0);
+
+    char invalid[sizeof(path) + sizeof("/child")];
+    snprintf(invalid, sizeof(invalid), "%s/child", path);
+    writer.fd = unrelated;
+    assert(fw_init(&writer, invalid, 10, 4) == -1);
+    assert(writer.fd == -1);
+    fw_close(&writer);
+    assert(fcntl(unrelated, F_GETFD) >= 0);
+
+    assert(fclose(fp) == 0);
+    assert(unlink(path) == 0);
+    assert(rmdir(directory) == 0);
 
     printf("All File Writer tests passed!\n");
 

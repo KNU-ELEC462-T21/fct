@@ -9,20 +9,13 @@ typedef struct {
     uint64_t file_size;
     uint32_t chunk_size;
     uint32_t total_chunks;
-    char filepath[512];
 } file_writer_t;
 
-int fw_init(file_writer_t *writer,
-            const char *filepath,
-            uint64_t total_size,
-            uint32_t chunk_size);
-ssize_t fw_write_chunk(file_writer_t *writer,
-                       uint32_t chunk_id,
-                       const void *buf,
-                       size_t len);
-ssize_t fw_write_at(file_writer_t *writer,
-                    uint64_t offset,
-                    const void *buf,
-                    size_t len);
-void fw_close(file_writer_t *writer);
+/* Initialize an inactive writer. On success, replace filepath with a
+ * preallocated file (mode 0600). On failure, leave filepath intact and any
+ * non-NULL writer safe to pass to fw_close(). */
+int fw_init(file_writer_t* writer, const char* filepath, uint64_t total_size, uint32_t chunk_size);
+ssize_t fw_write_chunk(file_writer_t* writer, uint32_t chunk_id, const void* buf, size_t len);
+ssize_t fw_write_at(file_writer_t* writer, uint64_t offset, const void* buf, size_t len);
+void fw_close(file_writer_t* writer);
 #endif

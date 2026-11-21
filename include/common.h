@@ -29,7 +29,7 @@ typedef struct {
 #pragma pack(pop)
 
 /* Return 0 on success, or -1 with errno set; EOF is ECONNRESET. */
-int send_exact(int sockfd, const void *buf, size_t len);
-int recv_exact(int sockfd, void *buf, size_t len);
+int send_exact(int sockfd, const void* buf, size_t len);
+int recv_exact(int sockfd, void* buf, size_t len);
 
 #endif

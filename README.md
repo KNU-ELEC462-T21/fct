@@ -10,7 +10,13 @@ On Ubuntu 24.04, run `make init` to install GCC and clang-format using
 ```
 
 The default port is 9000 and the default receive directory is the current
-directory. The command-line interface and module headers are scaffolding:
-file transfer and file I/O are not implemented yet. The network module uses
-big-endian protocol fields and rejects chunk payloads larger than the supplied
-buffer. Run `make test` to exercise the network module.
+directory. Use `-h` for help. Server and client modes are mutually exclusive;
+the client requires an IPv4 address and a file path, while `-d` is only valid
+for the server. Ports must be in the range 1–65535.
+
+Start the server first. It receives one file over a single TCP connection and
+exits. The output directory must already exist. The server saves the file under
+its original name after receiving it in full and reports an error if that name
+already exists. Check the server's exit status to confirm the file was saved.
+
+Run `make test` to exercise the CLI and network module.
