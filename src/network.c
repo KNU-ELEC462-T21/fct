@@ -10,29 +10,28 @@
 #define META_SIZE 276u
 #define CHUNK_SIZE 24u
 
-static void put32(unsigned char *p, uint32_t v) {
+static void put32(unsigned char* p, uint32_t v) {
     p[0] = (unsigned char)(v >> 24);
     p[1] = (unsigned char)(v >> 16);
     p[2] = (unsigned char)(v >> 8);
     p[3] = (unsigned char)v;
 }
 
-static void put64(unsigned char *p, uint64_t v) {
+static void put64(unsigned char* p, uint64_t v) {
     put32(p, (uint32_t)(v >> 32));
     put32(p + 4, (uint32_t)v);
 }
 
-static uint32_t get32(const unsigned char *p) {
-    return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) |
-           ((uint32_t)p[2] << 8) | (uint32_t)p[3];
+static uint32_t get32(const unsigned char* p) {
+    return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) | ((uint32_t)p[2] << 8) | (uint32_t)p[3];
 }
 
-static uint64_t get64(const unsigned char *p) {
+static uint64_t get64(const unsigned char* p) {
     return ((uint64_t)get32(p) << 32) | get32(p + 4);
 }
 
-int send_exact(int sockfd, const void *buf, size_t len) {
-    const unsigned char *p = buf;
+int send_exact(int sockfd, const void* buf, size_t len) {
+    const unsigned char* p = buf;
     if (len && !buf) {
         errno = EINVAL;
         return -1;
@@ -54,8 +53,8 @@ int send_exact(int sockfd, const void *buf, size_t len) {
     return 0;
 }
 
-int recv_exact(int sockfd, void *buf, size_t len) {
-    unsigned char *p = buf;
+int recv_exact(int sockfd, void* buf, size_t len) {
+    unsigned char* p = buf;
     if (len && !buf) {
         errno = EINVAL;
         return -1;
@@ -77,8 +76,7 @@ int recv_exact(int sockfd, void *buf, size_t len) {
     return 0;
 }
 
-static int
-channel_init(fct_channel_t *ch, int fd, const struct sockaddr_in *peer) {
+static int channel_init(fct_channel_t* ch, int fd, const struct sockaddr_in* peer) {
     memset(ch, 0, sizeof(*ch));
     ch->sockfd = -1;
     if (!inet_ntop(AF_INET, &peer->sin_addr, ch->peer_ip, sizeof(ch->peer_ip)))
@@ -88,7 +86,7 @@ channel_init(fct_channel_t *ch, int fd, const struct sockaddr_in *peer) {
     return 0;
 }
 
-int fct_channel_connect(fct_channel_t *ch, const char *server_ip, int port) {
+int fct_channel_connect(fct_channel_t* ch, const char* server_ip, int port) {
     struct sockaddr_in addr = {0};
     int fd, result, saved;
     if (!ch || !server_ip || port < 1 || port > 65535) {
@@ -108,8 +106,7 @@ int fct_channel_connect(fct_channel_t *ch, const char *server_ip, int port) {
     fd = socket(AF_INET, SOCK_STREAM, 0);
     if (fd < 0)
         return -1;
-    if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0 ||
-        channel_init(ch, fd, &addr) < 0) {
+    if (connect(fd, (struct sockaddr*)&addr, sizeof(addr)) < 0 || channel_init(ch, fd, &addr) < 0) {
         saved = errno;
         close(fd);
         errno = saved;
@@ -131,10 +128,8 @@ int fct_server_listen(int port) {
     addr.sin_family = AF_INET;
     addr.sin_addr.s_addr = htonl(INADDR_ANY);
     addr.sin_port = htons((uint16_t)port);
-    if (setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &enabled, sizeof(enabled)) <
-            0 ||
-        bind(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0 ||
-        listen(fd, 16) < 0) {
+    if (setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &enabled, sizeof(enabled)) < 0 ||
+        bind(fd, (struct sockaddr*)&addr, sizeof(addr)) < 0 || listen(fd, 16) < 0) {
         saved = errno;
         close(fd);
         errno = saved;
@@ -143,7 +138,7 @@ int fct_server_listen(int port) {
     return fd;
 }
 
-int fct_channel_accept(fct_channel_t *ch, int listen_fd) {
+int fct_channel_accept(fct_channel_t* ch, int listen_fd) {
     struct sockaddr_in peer;
     socklen_t len = sizeof(peer);
     int fd, saved;
@@ -154,7 +149,7 @@ int fct_channel_accept(fct_channel_t *ch, int listen_fd) {
     memset(ch, 0, sizeof(*ch));
     ch->sockfd = -1;
     do {
-        fd = accept(listen_fd, (struct sockaddr *)&peer, &len);
+        fd = accept(listen_fd, (struct sockaddr*)&peer, &len);
     } while (fd < 0 && errno == EINTR);
     if (fd < 0)
         return -1;
@@ -167,7 +162,7 @@ int fct_channel_accept(fct_channel_t *ch, int listen_fd) {
     return 0;
 }
 
-int fct_channel_send_meta(fct_channel_t *ch, const fct_file_meta_t *meta) {
+int fct_channel_send_meta(fct_channel_t* ch, const fct_file_meta_t* meta) {
     unsigned char wire[META_SIZE];
     if (!ch || !meta || ch->sockfd < 0 || meta->magic != FCT_MAGIC) {
         errno = EINVAL;
@@ -184,7 +179,7 @@ int fct_channel_send_meta(fct_channel_t *ch, const fct_file_meta_t *meta) {
     return 0;
 }
 
-int fct_channel_recv_meta(fct_channel_t *ch, fct_file_meta_t *out_meta) {
+int fct_channel_recv_meta(fct_channel_t* ch, fct_file_meta_t* out_meta) {
     unsigned char wire[META_SIZE];
     fct_file_meta_t meta;
     if (!ch || !out_meta || ch->sockfd < 0) {
@@ -207,12 +202,10 @@ int fct_channel_recv_meta(fct_channel_t *ch, fct_file_meta_t *out_meta) {
     return 0;
 }
 
-int fct_channel_send_chunk(fct_channel_t *ch,
-                           const fct_chunk_header_t *hdr,
-                           const void *payload) {
+int fct_channel_send_chunk(fct_channel_t* ch, const fct_chunk_header_t* hdr, const void* payload) {
     unsigned char wire[CHUNK_SIZE];
-    if (!ch || !hdr || ch->sockfd < 0 || hdr->magic != FCT_MAGIC ||
-        hdr->flags != 0 || (hdr->payload_len && !payload)) {
+    if (!ch || !hdr || ch->sockfd < 0 || hdr->magic != FCT_MAGIC || hdr->flags != 0 ||
+        (hdr->payload_len && !payload)) {
         errno = EINVAL;
         return -1;
     }
@@ -228,14 +221,11 @@ int fct_channel_send_chunk(fct_channel_t *ch,
     return 0;
 }
 
-int fct_channel_recv_chunk(fct_channel_t *ch,
-                           fct_chunk_header_t *out_hdr,
-                           void *payload_buf,
+int fct_channel_recv_chunk(fct_channel_t* ch, fct_chunk_header_t* out_hdr, void* payload_buf,
                            size_t payload_capacity) {
     unsigned char wire[CHUNK_SIZE];
     fct_chunk_header_t hdr;
-    if (!ch || !out_hdr || ch->sockfd < 0 ||
-        (!payload_buf && payload_capacity)) {
+    if (!ch || !out_hdr || ch->sockfd < 0 || (!payload_buf && payload_capacity)) {
         errno = EINVAL;
         return -1;
     }
@@ -261,7 +251,7 @@ int fct_channel_recv_chunk(fct_channel_t *ch,
     return 0;
 }
 
-void fct_channel_close(fct_channel_t *ch) {
+void fct_channel_close(fct_channel_t* ch) {
     if (ch && ch->sockfd >= 0) {
         close(ch->sockfd);
         ch->sockfd = -1;

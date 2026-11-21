@@ -7,7 +7,7 @@
 
 /* Open a regular file and compute its chunk count.
  * Return 0 on success, or -1 with errno set. */
-int fr_init(file_reader_t *reader, const char *filepath, uint32_t chunk_size) {
+int fr_init(file_reader_t* reader, const char* filepath, uint32_t chunk_size) {
     struct stat st;
     int fd, saved;
 
@@ -59,25 +59,22 @@ int fr_init(file_reader_t *reader, const char *filepath, uint32_t chunk_size) {
  * errno set (EIO if the file shrank since fr_init()).
  * pread() does not share a file offset, so several threads may read different
  * chunks through the same reader concurrently. */
-ssize_t fr_read_chunk(file_reader_t *reader, uint32_t chunk_id, void *buf) {
+ssize_t fr_read_chunk(file_reader_t* reader, uint32_t chunk_id, void* buf) {
     uint64_t offset, remain;
     size_t want, done = 0;
 
-    if (reader == NULL || buf == NULL || reader->fd < 0 ||
-        chunk_id >= reader->total_chunks) {
+    if (reader == NULL || buf == NULL || reader->fd < 0 || chunk_id >= reader->total_chunks) {
         errno = EINVAL;
         return -1;
     }
 
     offset = (uint64_t)chunk_id * reader->chunk_size;
     remain = reader->file_size - offset;
-    want = remain < reader->chunk_size ? (size_t)remain
-                                       : (size_t)reader->chunk_size;
+    want = remain < reader->chunk_size ? (size_t)remain : (size_t)reader->chunk_size;
 
     /* pread() may return fewer bytes than requested, so loop until full. */
     while (done < want) {
-        ssize_t n = pread(reader->fd, (char *)buf + done, want - done,
-                          (off_t)(offset + done));
+        ssize_t n = pread(reader->fd, (char*)buf + done, want - done, (off_t)(offset + done));
         if (n < 0) {
             if (errno == EINTR)
                 continue;
@@ -92,7 +89,7 @@ ssize_t fr_read_chunk(file_reader_t *reader, uint32_t chunk_id, void *buf) {
     return (ssize_t)done;
 }
 
-void fr_close(file_reader_t *reader) {
+void fr_close(file_reader_t* reader) {
     if (reader == NULL)
         return;
     if (reader->fd >= 0)

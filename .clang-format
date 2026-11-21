@@ -1,6 +1,31 @@
 BasedOnStyle: LLVM
-IndentWidth: 4
-ColumnLimit: 80
 
-BinPackParameters: false
-BinPackArguments: false
+IndentWidth: 4
+TabWidth: 4
+UseTab: Never
+ContinuationIndentWidth: 4
+
+ColumnLimit: 100
+
+BreakBeforeBraces: Attach
+
+SpaceBeforeParens: ControlStatements
+PointerAlignment: Left
+ReferenceAlignment: Left
+
+AllowShortFunctionsOnASingleLine: Empty
+AllowShortIfStatementsOnASingleLine: Never
+AllowShortLoopsOnASingleLine: false
+AllowShortBlocksOnASingleLine: Never
+
+AlignConsecutiveAssignments: None
+AlignConsecutiveDeclarations: None
+AlignTrailingComments:
+  Kind: Always
+
+SortIncludes: CaseSensitive
+IncludeBlocks: Preserve
+
+IndentCaseLabels: false
+FixNamespaceComments: true
+ReflowComments: true
