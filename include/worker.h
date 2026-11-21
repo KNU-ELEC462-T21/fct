@@ -17,10 +17,12 @@ typedef struct {
     void* context;
 } fct_progress_t;
 
-/* channel_count is the negotiated worker count. It is zero for empty files,
- * in which case channels may be NULL. Otherwise channels must contain that
- * many initialized channels, each exclusively used by one worker. progress
- * may be NULL. Otherwise keep it and its context alive until the call returns.
+/* channel_count is the negotiated worker count. For empty files
+ * (meta->total_chunks == 0), channel_count is 0 and channels may be NULL;
+ * fct_send_parallel returns 0 immediately, and fct_receive_parallel stores
+ * FCT_RESULT_OK in *result and returns 0 immediately. For nonempty files,
+ * channels must contain channel_count initialized channels, one per worker.
+ * If progress is supplied, keep it and its context alive until the call returns.
  * Both functions join all started workers before returning 0 on success or
  * -1 with errno set. The caller owns channel closure and file cleanup. */
 /* On success, the sender shuts down the write side of each data channel.

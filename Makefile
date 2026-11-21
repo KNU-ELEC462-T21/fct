@@ -1,5 +1,6 @@
 CC = gcc
 CLANG_FORMAT ?= clang-format
+LDLIBS += -lz -lpthread
 
 SRC = $(shell find src -name '*.c')
 OBJ = $(SRC:src/%.c=build/%.o)
@@ -8,9 +9,9 @@ TARGET = build/fct
 
 all: $(TARGET)
 
-$(TARGET): $(OBJ)
+$(TARGET): $(OBJ) Makefile
 	mkdir -p $(@D)
-	$(CC) $^ -o $@
+	$(CC) $(OBJ) -o $@ $(LDLIBS)
 
 build/%.o: src/%.c
 	mkdir -p $(@D)
@@ -18,7 +19,7 @@ build/%.o: src/%.c
 
 init:
 	sudo apt-get update
-	sudo apt-get install -y gcc clang-format
+	sudo apt-get install -y gcc clang-format zlib1g-dev
 
 test: build/network_test build/cli_test build/test_file_writer
 	./build/network_test
