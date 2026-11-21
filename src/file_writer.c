@@ -6,13 +6,20 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
+#include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
 
 int fw_init(file_writer_t *writer, const char *filepath,
             uint64_t total_size, uint32_t chunk_size)
 {
-    if (!writer || !filepath || !*filepath || chunk_size == 0) {
+    if (!writer) {
+        errno = EINVAL;
+        return -1;
+    }
+    writer->fd = -1;
+    if (!filepath || !*filepath || chunk_size == 0) {
         errno = EINVAL;
         return -1;
     }
@@ -30,20 +37,26 @@ int fw_init(file_writer_t *writer, const char *filepath,
         return -1;
     }
 
-    int fd = open(filepath, O_WRONLY | O_CREAT | O_TRUNC, 0666);
+    /* Allocate in the same directory so the final rename is atomic. */
+    char temporary[sizeof(writer->filepath) + sizeof(".fct-XXXXXX")];
+    const char *slash = strrchr(filepath, '/');
+    size_t prefix = slash ? (size_t)(slash - filepath) + 1 : 0;
+    memcpy(temporary, filepath, prefix);
+    memcpy(temporary + prefix, ".fct-XXXXXX", sizeof(".fct-XXXXXX"));
+    int fd = mkstemp(temporary);
 
     if (fd == -1)
         return -1;
 
     /* Reserve disk space for non-empty output files. */
-    if (total_size != 0) {
-        int err = posix_fallocate(fd, 0, (off_t)total_size);
-
-        if (err != 0) {
-            close(fd);
-            errno = err;
-            return -1;
-        }
+    int err = total_size ? posix_fallocate(fd, 0, (off_t)total_size) : 0;
+    if (err == 0 && rename(temporary, filepath) < 0)
+        err = errno;
+    if (err != 0) {
+        close(fd);
+        unlink(temporary);
+        errno = err;
+        return -1;
     }
 
     writer->fd = fd;

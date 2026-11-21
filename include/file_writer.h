@@ -12,6 +12,9 @@ typedef struct {
     char filepath[512];
 } file_writer_t;
 
+/* Initialize an inactive writer. On success, replace filepath with a
+ * preallocated file (mode 0600). On failure, leave filepath intact and any
+ * non-NULL writer safe to pass to fw_close(). */
 int fw_init(file_writer_t *writer,
             const char *filepath,
             uint64_t total_size,
