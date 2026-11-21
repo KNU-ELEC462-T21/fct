@@ -8,7 +8,8 @@
 #define DEFAULT_CHUNK_SZ (2 * 1024 * 1024)
 #define FCT_DEFAULT_PORT 9000
 
-/* Protocol fields; transport must explicitly convert integer byte order. */
+/* Wire integers use big-endian byte order; filenames occupy exactly 256 bytes.
+ * Metadata is 276 bytes and chunk headers are 24 bytes on the wire. */
 #pragma pack(push, 1)
 typedef struct {
     uint32_t magic;
@@ -27,6 +28,7 @@ typedef struct {
 } fct_chunk_header_t;
 #pragma pack(pop)
 
+/* Return 0 on success, or -1 with errno set; EOF is ECONNRESET. */
 int send_exact(int sockfd, const void *buf, size_t len);
 int recv_exact(int sockfd, void *buf, size_t len);
 
