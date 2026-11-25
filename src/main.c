@@ -11,6 +11,7 @@
 #include "file_reader.h"
 #include "file_writer.h"
 #include "network.h"
+#include "progress.h"
 
 static int send_file(const fct_options_t* options) {
     const char* name = strrchr(options->file_path, '/');
@@ -42,6 +43,10 @@ static int send_file(const fct_options_t* options) {
         fct_channel_send_meta(&channel, &meta) < 0)
         goto cleanup;
 
+    fct_progress_state_t progress;
+    if (fct_progress_init(&progress, meta.file_size, stderr) < 0)
+        goto cleanup;
+
     for (uint32_t id = 0; id < meta.total_chunks; ++id) {
         ssize_t length = fr_read_chunk(&reader, id, payload);
         if (length < 0)
@@ -52,9 +57,15 @@ static int send_file(const fct_options_t* options) {
             .offset = (uint64_t)id * meta.chunk_size,
             .payload_len = (uint32_t)length,
         };
-        if (fct_channel_send_chunk(&channel, &header, payload) < 0)
+        if (fct_channel_send_chunk(&channel, &header, payload) < 0) {
+            fct_progress_destroy(&progress);
             goto cleanup;
+        }
+
+        fct_progress_on_chunk(&progress, (size_t)length, (size_t)length);
     }
+    fct_progress_finish(&progress);
+    fct_progress_destroy(&progress);
     result = 0;
 
 cleanup:
