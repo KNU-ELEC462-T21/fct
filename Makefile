@@ -21,11 +21,21 @@ init:
 	sudo apt-get update
 	sudo apt-get install -y gcc clang-format zlib1g-dev
 
-test: build/network_test build/cli_test build/test_file_writer build/worker_test
+test: build/network_test build/cli_test build/test_file_writer build/file_reader_test build/compress_test build/worker_test
 	./build/network_test
 	./build/cli_test
 	./build/test_file_writer
+	./build/file_reader_test
+	./build/compress_test
 	./build/worker_test
+
+build/file_reader_test: tests/file_reader_test.c src/file_reader.c include/file_reader.h
+	mkdir -p $(@D)
+	$(CC) -Wall -Wextra -Werror -Iinclude tests/file_reader_test.c src/file_reader.c -o $@
+
+build/compress_test: tests/compress_test.c src/compress.c include/compress.h include/common.h
+	mkdir -p $(@D)
+	$(CC) -Wall -Wextra -Werror -Iinclude tests/compress_test.c src/compress.c -o $@ -lz
 
 build/test_file_writer: tests/test_file_writer.c src/file_writer.c include/file_writer.h
 	mkdir -p $(@D)
