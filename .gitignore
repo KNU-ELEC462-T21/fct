@@ -56,3 +56,11 @@ dkms.conf
 
 # Build output folder
 build/
+
+# Benchmark generated datasets and temporary files
+bench/data/
+bench/tmp/
+
+# Python caches
+__pycache__/
+*.py[cod]

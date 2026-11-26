@@ -1,4 +1,5 @@
 CC = gcc
+CFLAGS ?= -O2
 CLANG_FORMAT ?= clang-format
 LDLIBS += -lz -lpthread
 
@@ -15,7 +16,7 @@ $(TARGET): $(OBJ) Makefile
 
 build/%.o: src/%.c
 	mkdir -p $(@D)
-	$(CC) -Iinclude -c $< -o $@
+	$(CC) $(CFLAGS) -Iinclude -c $< -o $@
 
 init:
 	sudo apt-get update
@@ -74,4 +75,7 @@ format:
 clean:
 	rm -rf build
 
-.PHONY: all clean format init test
+bench: $(TARGET)
+	python3 bench/run_bench.py
+
+.PHONY: all clean format init test bench
