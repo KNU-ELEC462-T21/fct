@@ -21,12 +21,23 @@ init:
 	sudo apt-get update
 	sudo apt-get install -y gcc clang-format zlib1g-dev
 
-test: build/network_test build/cli_test build/cli_extended_test build/progress_test build/test_file_writer
+test: build/network_test build/cli_test build/cli_extended_test build/progress_test build/test_file_writer build/file_reader_test build/compress_test build/worker_test
 	./build/network_test
 	./build/cli_test
 	./build/cli_extended_test
 	./build/progress_test
 	./build/test_file_writer
+	./build/file_reader_test
+	./build/compress_test
+	./build/worker_test
+
+build/file_reader_test: tests/file_reader_test.c src/file_reader.c include/file_reader.h
+	mkdir -p $(@D)
+	$(CC) -Wall -Wextra -Werror -Iinclude tests/file_reader_test.c src/file_reader.c -o $@
+
+build/compress_test: tests/compress_test.c src/compress.c include/compress.h include/common.h
+	mkdir -p $(@D)
+	$(CC) -Wall -Wextra -Werror -Iinclude tests/compress_test.c src/compress.c -o $@ -lz
 
 build/test_file_writer: tests/test_file_writer.c src/file_writer.c include/file_writer.h
 	mkdir -p $(@D)
@@ -46,7 +57,11 @@ build/progress_test: tests/progress_test.c src/progress.c include/progress.h
 
 build/network_test: tests/network_test.c src/network.c include/network.h include/common.h
 	mkdir -p $(@D)
-	$(CC) -Wall -Wextra -Werror -Iinclude tests/network_test.c src/network.c -o $@
+	$(CC) -std=c11 -Wall -Wextra -Werror -Iinclude tests/network_test.c src/network.c -o $@
+
+build/worker_test: tests/worker_test.c tests/compress_stub.c tests/compress_stub.h src/worker.c src/network.c src/file_reader.c src/file_writer.c include/worker.h include/network.h include/compress.h include/file_reader.h include/file_writer.h include/common.h
+	mkdir -p $(@D)
+	$(CC) -Wall -Wextra -Werror -Iinclude tests/worker_test.c tests/compress_stub.c src/worker.c src/network.c src/file_reader.c src/file_writer.c -o $@ -lpthread
 
 format:
 	find src include -type f \( -name '*.c' -o -name '*.h' \) -exec $(CLANG_FORMAT) -i {} +
