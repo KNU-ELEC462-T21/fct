@@ -165,7 +165,10 @@ static void* send_worker_main(void* arg) {
 
 int fct_send_parallel(fct_channel_t* channels, size_t channel_count, file_reader_t* reader,
                       const fct_file_meta_t* meta, fct_compression_mode_t mode,
+                      const fct_bitmap_t* completed, bool is_retry,
                       const fct_progress_t* progress) {
+    (void)completed;
+    (void)is_retry;
     if (!validate_meta(meta) || !reader || reader->fd < 0 || reader->file_size != meta->file_size ||
         reader->chunk_size != meta->chunk_size || reader->total_chunks != meta->total_chunks ||
         !is_valid_compression_mode(mode)) {
@@ -440,8 +443,12 @@ static void* recv_worker_main(void* arg) {
 }
 
 int fct_receive_parallel(fct_channel_t* channels, size_t channel_count, file_writer_t* writer,
-                         const fct_file_meta_t* meta, const fct_progress_t* progress,
+                         const fct_file_meta_t* meta, fct_bitmap_t* completed,
+                         const fct_progress_t* progress, uint32_t* out_crc_errors,
                          fct_result_t* result) {
+    (void)completed;
+    if (out_crc_errors)
+        *out_crc_errors = 0;
     if (!result) {
         errno = EINVAL;
         return -1;

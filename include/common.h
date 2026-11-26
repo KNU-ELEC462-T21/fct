@@ -9,7 +9,12 @@
 #define FCT_DEFAULT_PORT 9000
 
 #define FCT_MAX_DATA_WORKERS 8
+#define FCT_SHA256_SIZE 32
 #define FCT_CHUNK_FLAG_COMPRESSED UINT32_C(1)
+#define FCT_CHUNK_FLAG_EOR UINT32_C(2)
+#define FCT_MAX_CHUNK_RETRIES 3U
+#define FCT_MAX_BITMAP_BYTES (4U * 1024U * 1024U)
+#define FCT_BITMAP_HEADER_WIRE_SIZE 8
 #define FCT_TRANSFER_TOKEN_SIZE 16
 #define FCT_CONTROL_FRAME_WIRE_SIZE 24
 
@@ -23,6 +28,7 @@ typedef enum {
     FCT_CONTROL_READY = 2,
     FCT_CONTROL_DATA = 3,
     FCT_CONTROL_RESULT = 4,
+    FCT_CONTROL_RETRY = 5,
 } fct_control_type_t;
 
 typedef enum {
@@ -30,14 +36,17 @@ typedef enum {
     FCT_RESULT_PROTOCOL_ERROR = 1,
     FCT_RESULT_STORAGE_ERROR = 2,
     FCT_RESULT_TRANSFER_ERROR = 3,
+    FCT_RESULT_CHECKSUM_ERROR = 4,
 } fct_result_t;
 
 /* Host-order fields in wire order. Use FCT_MAGIC for magic and serialize
  * integers explicitly as big-endian.
- * HELLO and READY carry the actual worker count in arg. DATA carries a
- * zero-based connection index. RESULT carries an fct_result_t value.
+ * HELLO carries the requested worker count in arg and READY carries the
+ * negotiated worker count. DATA carries a zero-based connection index.
+ * RESULT carries an fct_result_t value. RETRY carries the 1-based retry
+ * round (1..FCT_MAX_CHUNK_RETRIES).
  * Use an all-zero token in HELLO and pre-READY errors, and the token issued
- * in READY for DATA and subsequent RESULT frames. */
+ * in READY for DATA, RETRY, and subsequent RESULT frames. */
 typedef struct {
     uint32_t magic;
     uint16_t type;
@@ -46,7 +55,7 @@ typedef struct {
 } fct_control_frame_t;
 
 /* Wire integers use big-endian byte order; filenames occupy exactly 256 bytes.
- * Metadata is 276 bytes and chunk headers are 24 bytes on the wire. */
+ * Metadata is 308 bytes and chunk headers are 28 bytes on the wire. */
 #pragma pack(push, 1)
 typedef struct {
     uint32_t magic;
@@ -54,6 +63,7 @@ typedef struct {
     uint32_t chunk_size;
     uint32_t total_chunks;
     char filename[256];
+    uint8_t file_sha256[FCT_SHA256_SIZE];
 } fct_file_meta_t;
 
 typedef struct {
@@ -61,7 +71,10 @@ typedef struct {
     uint32_t chunk_id;
     uint64_t offset;
     uint32_t payload_len; /* Bytes on the wire. Derive the raw length from metadata. */
-    uint32_t flags;       /* Zero for raw data, FCT_CHUNK_FLAG_COMPRESSED for zlib data. */
+    uint32_t flags;       /* 0 (raw), FCT_CHUNK_FLAG_COMPRESSED, or FCT_CHUNK_FLAG_EOR
+                           * (mutually exclusive; EOR requires zero chunk_id/offset/
+                           * payload_len/crc32). */
+    uint32_t crc32;       /* CRC32 of raw (uncompressed) chunk data. */
 } fct_chunk_header_t;
 #pragma pack(pop)
 

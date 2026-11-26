@@ -40,6 +40,14 @@ int fct_channel_send_meta_until(fct_channel_t* ch, const fct_file_meta_t* meta,
 int fct_channel_recv_meta_until(fct_channel_t* ch, fct_file_meta_t* meta,
                                 const struct timespec* deadline);
 
+/* Wire format: magic(u32) | byte_len(u32) | bits[byte_len] (big-endian).
+ * byte_len must not exceed FCT_MAX_BITMAP_BYTES; receive verifies byte_len
+ * matches expected_byte_len and returns -1/EPROTO otherwise. */
+int fct_channel_send_bitmap_until(fct_channel_t* ch, const uint8_t* bits, size_t byte_len,
+                                  const struct timespec* deadline);
+int fct_channel_recv_bitmap_until(fct_channel_t* ch, uint8_t* bits, size_t expected_byte_len,
+                                  const struct timespec* deadline);
+
 /* The idle timeout covers the header and payload. Only bytes transferred
  * reset it. Return 0 on success or -1 with errno set. The receive call also
  * returns 1 for EOF before the next header and -1/EPROTO for a truncated frame. */

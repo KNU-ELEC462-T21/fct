@@ -314,13 +314,14 @@ static int send_session(const fct_options_t* options, file_reader_t* reader,
 
     int send_rc = -1;
     if (worker_count == 0) {
-        send_rc = fct_send_parallel(NULL, 0, reader, meta, mode, &cb);
+        send_rc = fct_send_parallel(NULL, 0, reader, meta, mode, NULL, false, &cb);
     } else if (worker_count == 1) {
-        send_rc = fct_send_parallel(&control, 1, reader, meta, mode, &cb);
+        send_rc = fct_send_parallel(&control, 1, reader, meta, mode, NULL, false, &cb);
     } else {
         fct_channel_t data_channels[FCT_MAX_DATA_WORKERS];
         if (open_data_channels(options, worker_count, token, data_channels) == 0) {
-            send_rc = fct_send_parallel(data_channels, worker_count, reader, meta, mode, &cb);
+            send_rc = fct_send_parallel(data_channels, worker_count, reader, meta, mode, NULL,
+                                        false, &cb);
             int saved = errno;
             close_channels(data_channels, worker_count);
             errno = saved;
@@ -537,12 +538,12 @@ static int receive_payload_and_publish(fct_channel_t* control, int* listener,
     fct_result_t recv_result = FCT_RESULT_PROTOCOL_ERROR;
     int recv_rc = -1;
     if (worker_count == 0) {
-        recv_rc = fct_receive_parallel(NULL, 0, writer, meta, NULL, &recv_result);
+        recv_rc = fct_receive_parallel(NULL, 0, writer, meta, NULL, NULL, NULL, &recv_result);
     } else if (worker_count == 1) {
-        recv_rc = fct_receive_parallel(control, 1, writer, meta, NULL, &recv_result);
+        recv_rc = fct_receive_parallel(control, 1, writer, meta, NULL, NULL, NULL, &recv_result);
     } else {
-        recv_rc =
-            fct_receive_parallel(data_channels, worker_count, writer, meta, NULL, &recv_result);
+        recv_rc = fct_receive_parallel(data_channels, worker_count, writer, meta, NULL, NULL, NULL,
+                                       &recv_result);
         int saved = errno;
         close_channels(data_channels, worker_count);
         errno = saved;
