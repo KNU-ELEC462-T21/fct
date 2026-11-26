@@ -21,9 +21,11 @@ init:
 	sudo apt-get update
 	sudo apt-get install -y gcc clang-format zlib1g-dev
 
-test: build/network_test build/cli_test build/test_file_writer
+test: build/network_test build/cli_test build/cli_extended_test build/progress_test build/test_file_writer
 	./build/network_test
 	./build/cli_test
+	./build/cli_extended_test
+	./build/progress_test
 	./build/test_file_writer
 
 build/test_file_writer: tests/test_file_writer.c src/file_writer.c include/file_writer.h
@@ -33,6 +35,14 @@ build/test_file_writer: tests/test_file_writer.c src/file_writer.c include/file_
 build/cli_test: tests/cli_test.c src/cli.c include/cli.h include/common.h
 	mkdir -p $(@D)
 	$(CC) -Wall -Wextra -Werror -Iinclude tests/cli_test.c src/cli.c -o $@
+
+build/cli_extended_test: tests/cli_extended_test.c src/cli.c include/cli.h include/common.h
+	mkdir -p $(@D)
+	$(CC) -Wall -Wextra -Werror -Iinclude tests/cli_extended_test.c src/cli.c -o $@
+
+build/progress_test: tests/progress_test.c src/progress.c include/progress.h
+	mkdir -p $(@D)
+	$(CC) -Wall -Wextra -Werror -Iinclude tests/progress_test.c src/progress.c -o $@ -lpthread
 
 build/network_test: tests/network_test.c src/network.c include/network.h include/common.h
 	mkdir -p $(@D)

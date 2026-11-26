@@ -1,51 +1,64 @@
 #include "cli.h"
 
-#include <assert.h>
 #include <stdio.h>
+#include <stdlib.h>
 
-static int parse(int argc, char **argv, fct_options_t *options)
-{
-    return fct_parse_options(argc, argv, options, stderr);
+#define CHECK(cond)                                                                                \
+    do {                                                                                           \
+        if (!(cond)) {                                                                             \
+            fprintf(stderr, "%s:%d: CHECK failed: %s\n", __FILE__, __LINE__, #cond);               \
+            exit(1);                                                                               \
+        }                                                                                          \
+    } while (0)
+
+static int parse(int argc, char** argv, fct_options_t* options, FILE* err) {
+    return fct_parse_options(argc, argv, options, err);
 }
 
-int main(void)
-{
+int main(void) {
     fct_options_t options;
+    FILE* err = tmpfile();
+    CHECK(err != NULL);
 
-    char *normal[] = {
-        "fct", "-c", "127.0.0.1", "-f", "test.bin",
-        "-t", "4", "-z", NULL
-    };
+    char* normal[] = {"fct", "-c", "127.0.0.1", "-f", "test.bin", "-t", "4", "-z", NULL};
+    CHECK(parse(8, normal, &options, err) == 0);
+    CHECK(options.mode == FCT_MODE_CLIENT);
+    CHECK(options.worker_count == 4);
+    CHECK(options.force_compression);
 
-    assert(parse(8, normal, &options) == 0);
-    assert(options.mode == FCT_MODE_CLIENT);
-    assert(options.worker_count == 4);
-    assert(options.compression_enabled == 1);
+    char* client_defaults[] = {"fct", "-c", "127.0.0.1", "-f", "test.bin", NULL};
+    CHECK(parse(5, client_defaults, &options, err) == 0);
+    CHECK(options.mode == FCT_MODE_CLIENT);
+    CHECK(options.worker_count == 1);
+    CHECK(!options.force_compression);
 
-    char *invalid_workers[] = {
-        "fct", "-c", "127.0.0.1", "-f", "test.bin",
-        "-t", "9", NULL
-    };
-    assert(parse(7, invalid_workers, &options) == -1);
+    char* invalid_workers[] = {"fct", "-c", "127.0.0.1", "-f", "test.bin", "-t", "9", NULL};
+    CHECK(parse(7, invalid_workers, &options, err) == -1);
 
-    char *invalid_zero[] = {
-        "fct", "-c", "127.0.0.1", "-f", "test.bin",
-        "-t", "0", NULL
-    };
-    assert(parse(7, invalid_zero, &options) == -1);
+    char* invalid_zero[] = {"fct", "-c", "127.0.0.1", "-f", "test.bin", "-t", "0", NULL};
+    CHECK(parse(7, invalid_zero, &options, err) == -1);
 
-    char *server_compression[] = {
-        "fct", "-s", "-z", NULL
-    };
-    assert(parse(3, server_compression, &options) == -1);
+    char* invalid_alpha[] = {"fct", "-c", "127.0.0.1", "-f", "test.bin", "-t", "abc", NULL};
+    CHECK(parse(7, invalid_alpha, &options, err) == -1);
 
-    char *defaults[] = {
-        "fct", "-s", NULL
-    };
-    assert(parse(2, defaults, &options) == 0);
-    assert(options.worker_count == 1);
-    assert(options.compression_enabled == 0);
+    char* invalid_neg[] = {"fct", "-c", "127.0.0.1", "-f", "test.bin", "-t", "-1", NULL};
+    CHECK(parse(7, invalid_neg, &options, err) == -1);
 
+    char* server_compression[] = {"fct", "-s", "-z", NULL};
+    CHECK(parse(3, server_compression, &options, err) == -1);
+
+    char* server_workers_one[] = {"fct", "-s", "-t", "1", NULL};
+    CHECK(parse(4, server_workers_one, &options, err) == -1);
+
+    char* server_workers_four[] = {"fct", "-s", "-t", "4", NULL};
+    CHECK(parse(4, server_workers_four, &options, err) == -1);
+
+    char* defaults[] = {"fct", "-s", NULL};
+    CHECK(parse(2, defaults, &options, err) == 0);
+    CHECK(options.worker_count == 1);
+    CHECK(!options.force_compression);
+
+    fclose(err);
     printf("Extended CLI tests passed!\n");
     return 0;
 }

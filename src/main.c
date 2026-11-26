@@ -13,6 +13,42 @@
 #include "network.h"
 #include "progress.h"
 
+static int send_chunks(fct_channel_t* channel, file_reader_t* reader, const fct_file_meta_t* meta,
+                       void* payload) {
+    fct_progress_state_t progress;
+    if (fct_progress_init(&progress, meta->file_size, stderr) < 0)
+        return -1;
+
+    int result = 0;
+    for (uint32_t id = 0; id < meta->total_chunks; ++id) {
+        ssize_t length = fr_read_chunk(reader, id, payload);
+        if (length < 0) {
+            result = -1;
+            break;
+        }
+        fct_chunk_header_t header = {
+            .magic = FCT_MAGIC,
+            .chunk_id = id,
+            .offset = (uint64_t)id * meta->chunk_size,
+            .payload_len = (uint32_t)length,
+        };
+        if (fct_channel_send_chunk(channel, &header, payload) < 0) {
+            result = -1;
+            break;
+        }
+        fct_progress_on_chunk(&progress, (size_t)length, (size_t)length);
+    }
+
+    int saved = errno;
+    if (result == 0)
+        fct_progress_finish(&progress);
+    else
+        fct_progress_abort(&progress);
+    fct_progress_destroy(&progress);
+    errno = saved;
+    return result;
+}
+
 static int send_file(const fct_options_t* options) {
     const char* name = strrchr(options->file_path, '/');
     name = name ? name + 1 : options->file_path;
@@ -32,44 +68,17 @@ static int send_file(const fct_options_t* options) {
     meta.total_chunks = reader.total_chunks;
 
     fct_channel_t channel = {.sockfd = -1};
-    void* payload = NULL;
-    int result = -1, saved;
-    if (meta.total_chunks != 0) {
-        payload = malloc(meta.chunk_size);
-        if (!payload)
-            goto cleanup;
-    }
-    if (fct_channel_connect(&channel, options->server_ip, options->port) < 0 ||
-        fct_channel_send_meta(&channel, &meta) < 0)
-        goto cleanup;
+    void* payload = meta.total_chunks != 0 ? malloc(meta.chunk_size) : NULL;
+    int result = -1;
 
-    fct_progress_state_t progress;
-    if (fct_progress_init(&progress, meta.file_size, stderr) < 0)
-        goto cleanup;
-
-    for (uint32_t id = 0; id < meta.total_chunks; ++id) {
-        ssize_t length = fr_read_chunk(&reader, id, payload);
-        if (length < 0)
-            goto cleanup;
-        fct_chunk_header_t header = {
-            .magic = FCT_MAGIC,
-            .chunk_id = id,
-            .offset = (uint64_t)id * meta.chunk_size,
-            .payload_len = (uint32_t)length,
-        };
-        if (fct_channel_send_chunk(&channel, &header, payload) < 0) {
-            fct_progress_destroy(&progress);
-            goto cleanup;
+    if (meta.total_chunks == 0 || payload != NULL) {
+        if (fct_channel_connect(&channel, options->server_ip, options->port) == 0 &&
+            fct_channel_send_meta(&channel, &meta) == 0) {
+            result = send_chunks(&channel, &reader, &meta, payload);
         }
-
-        fct_progress_on_chunk(&progress, (size_t)length, (size_t)length);
     }
-    fct_progress_finish(&progress);
-    fct_progress_destroy(&progress);
-    result = 0;
 
-cleanup:
-    saved = errno;
+    int saved = errno;
     fct_channel_close(&channel);
     fr_close(&reader);
     free(payload);
@@ -148,8 +157,7 @@ static int receive_file(fct_channel_t* channel, const char* directory) {
         goto cleanup;
 
     temporary_file = join_path(temporary_dir, "data");
-    if (temporary_file &&
-        fw_init(&writer, temporary_file, meta.file_size, meta.chunk_size) == 0 &&
+    if (temporary_file && fw_init(&writer, temporary_file, meta.file_size, meta.chunk_size) == 0 &&
         receive_chunks(channel, &writer) == 0 && fsync(writer.fd) == 0) {
         /* Publish only a complete file and preserve any existing destination. */
         result = link(temporary_file, destination);
