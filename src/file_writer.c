@@ -9,6 +9,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 int fw_init(file_writer_t* writer, const char* filepath, uint64_t total_size, uint32_t chunk_size) {
@@ -65,6 +66,50 @@ int fw_init(file_writer_t* writer, const char* filepath, uint64_t total_size, ui
     writer->chunk_size = chunk_size;
     writer->total_chunks = (uint32_t)chunks;
 
+    return 0;
+}
+
+int fw_open_existing(file_writer_t* writer, const char* filepath, uint64_t total_size,
+                     uint32_t chunk_size) {
+    if (!writer) {
+        errno = EINVAL;
+        return -1;
+    }
+    writer->fd = -1;
+    if (!filepath || !*filepath || chunk_size == 0) {
+        errno = EINVAL;
+        return -1;
+    }
+
+    uint64_t chunks = total_size / chunk_size + (total_size % chunk_size != 0);
+    if (total_size > INT64_MAX || chunks > UINT32_MAX) {
+        errno = EOVERFLOW;
+        return -1;
+    }
+
+    int fd = open(filepath, O_RDWR | O_NOFOLLOW | O_NONBLOCK);
+    if (fd < 0)
+        return -1;
+
+    struct stat st;
+    int err = 0;
+    if (fstat(fd, &st) < 0)
+        err = errno;
+    else if (!S_ISREG(st.st_mode))
+        err = EINVAL;
+    else if (st.st_size != (off_t)total_size)
+        err = EIO;
+
+    if (err != 0) {
+        close(fd);
+        errno = err;
+        return -1;
+    }
+
+    writer->fd = fd;
+    writer->file_size = total_size;
+    writer->chunk_size = chunk_size;
+    writer->total_chunks = (uint32_t)chunks;
     return 0;
 }
 

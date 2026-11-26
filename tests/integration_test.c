@@ -914,10 +914,41 @@ static void test_server_protocol_errors(void) {
     }
 }
 
+static void test_server_rejects_invalid_filenames(void) {
+    const char* names[] = {"", ".", "..", "../escape", "/absolute", "subdir/file"};
+    for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); ++i) {
+        char dst_dir[64];
+        make_temp_dir(dst_dir, sizeof(dst_dir));
+        int port = 0;
+        pid_t srv = spawn_server_ready(dst_dir, &port);
+        struct timespec dl = deadline_after(5000);
+        fct_channel_t ctrl = {.sockfd = -1};
+        fct_control_frame_t hello = {.magic = FCT_MAGIC, .type = FCT_CONTROL_HELLO};
+        fct_file_meta_t meta = {.magic = FCT_MAGIC, .chunk_size = DEFAULT_CHUNK_SZ};
+        strcpy(meta.filename, names[i]);
+
+        CHECK(fct_channel_connect_until(&ctrl, "127.0.0.1", port, &dl) == 0);
+        CHECK(fct_channel_send_control_until(&ctrl, &hello, &dl) == 0);
+        CHECK(fct_channel_send_meta_until(&ctrl, &meta, &dl) == 0);
+        fct_control_frame_t result;
+        CHECK(fct_channel_recv_control_until(&ctrl, &result, &dl) == 0);
+        CHECK(result.type == FCT_CONTROL_RESULT && result.arg == FCT_RESULT_PROTOCOL_ERROR);
+        fct_channel_close(&ctrl);
+
+        int srv_rc = -1;
+        CHECK(wait_pid_timeout(srv, 10000, &srv_rc) == 0);
+        CHECK(srv_rc != 0);
+        CHECK(!dir_has_temp_entries(dst_dir));
+        CHECK(rmdir(dst_dir) == 0);
+    }
+}
+
 static void test_existing_destination_preserved(void) {
     static const unsigned char sentinel[] = "DO_NOT_OVERWRITE_SENTINEL";
-    for (int empty = 0; empty <= 1; ++empty) {
-        char src_dir[64], dst_dir[64], src_path[256], dst_path[256], ref_path[256];
+    for (int scenario = 0; scenario < 3; ++scenario) {
+        bool empty = scenario == 1;
+        bool is_symlink = scenario == 2;
+        char src_dir[64], dst_dir[64], src_path[256], dst_path[256], ref_path[256], target[256];
         make_temp_dir(src_dir, sizeof(src_dir));
         make_temp_dir(dst_dir, sizeof(dst_dir));
         snprintf(src_path, sizeof(src_path), "%s/existing.dat", src_dir);
@@ -931,7 +962,13 @@ static void test_existing_destination_preserved(void) {
             write_file_bytes(src_path, new_data, 1024);
             free(new_data);
         }
-        write_file_bytes(dst_path, sentinel, sizeof(sentinel) - 1);
+        if (is_symlink) {
+            snprintf(target, sizeof(target), "%s/target.dat", src_dir);
+            write_file_bytes(target, sentinel, sizeof(sentinel) - 1);
+            CHECK(symlink(target, dst_path) == 0);
+        } else {
+            write_file_bytes(dst_path, sentinel, sizeof(sentinel) - 1);
+        }
         write_file_bytes(ref_path, sentinel, sizeof(sentinel) - 1);
 
         int port = 0;
@@ -944,6 +981,12 @@ static void test_existing_destination_preserved(void) {
         CHECK(cli_rc != 0);
         CHECK(srv_rc != 0);
         CHECK(files_equal(ref_path, dst_path));
+        if (is_symlink) {
+            char actual[256];
+            ssize_t len = readlink(dst_path, actual, sizeof(actual));
+            CHECK(len == (ssize_t)strlen(target));
+            CHECK(memcmp(actual, target, (size_t)len) == 0);
+        }
         CHECK(!dir_has_temp_entries(dst_dir));
 
         remove_tree(src_dir);
@@ -958,6 +1001,7 @@ int main(void) {
     test_server_single_conn_failure_result();
     test_server_lost_result_after_publish();
     test_server_protocol_errors();
+    test_server_rejects_invalid_filenames();
     test_existing_destination_preserved();
     printf("integration_test: all tests passed\n");
     return 0;

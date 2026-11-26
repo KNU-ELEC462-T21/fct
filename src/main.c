@@ -7,7 +7,6 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -84,7 +83,7 @@ static int generate_token(uint8_t token[FCT_TRANSFER_TOKEN_SIZE]) {
 }
 
 static bool is_valid_result_code(uint16_t arg) {
-    return arg <= FCT_RESULT_TRANSFER_ERROR;
+    return arg <= FCT_RESULT_CHECKSUM_ERROR;
 }
 
 static int result_to_errno(uint16_t code) {
@@ -97,6 +96,8 @@ static int result_to_errno(uint16_t code) {
         return EIO;
     case FCT_RESULT_TRANSFER_ERROR:
         return ECONNABORTED;
+    case FCT_RESULT_CHECKSUM_ERROR:
+        return EBADMSG;
     default:
         return EPROTO;
     }
@@ -117,10 +118,13 @@ static int send_result_frame(fct_channel_t* ch, fct_result_t code,
     return fct_channel_send_control_until(ch, &frame, &deadline);
 }
 
+static bool is_valid_filename(const char* name) {
+    return name[0] && !strchr(name, '/') && strcmp(name, ".") != 0 && strcmp(name, "..") != 0;
+}
+
 static bool validate_meta_and_workers(const fct_file_meta_t* meta, uint16_t workers) {
-    if (!meta || !memchr(meta->filename, '\0', sizeof(meta->filename)) || !meta->filename[0] ||
-        strchr(meta->filename, '/') || strcmp(meta->filename, ".") == 0 ||
-        strcmp(meta->filename, "..") == 0 || meta->chunk_size == 0 ||
+    if (!meta || !memchr(meta->filename, '\0', sizeof(meta->filename)) ||
+        !is_valid_filename(meta->filename) || meta->chunk_size == 0 ||
         meta->chunk_size > DEFAULT_CHUNK_SZ || meta->file_size > (uint64_t)INT64_MAX) {
         return false;
     }
@@ -365,6 +369,10 @@ static int send_file(const fct_options_t* options) {
         errno = ENAMETOOLONG;
         return -1;
     }
+    if (!is_valid_filename(name)) {
+        errno = EINVAL;
+        return -1;
+    }
     strcpy(meta.filename, name);
 
     file_reader_t reader;
@@ -497,7 +505,7 @@ static int receive_handshake(fct_channel_t* control, fct_file_meta_t* out_meta,
 static int receive_payload_and_publish(fct_channel_t* control, int* listener,
                                        const fct_file_meta_t* meta, uint16_t worker_count,
                                        file_writer_t* writer, const char* temporary_file,
-                                       const char* destination) {
+                                       int output_fd) {
     uint8_t session_token[FCT_TRANSFER_TOKEN_SIZE] = {0};
     if (generate_token(session_token) < 0) {
         int saved = errno;
@@ -556,7 +564,9 @@ static int receive_payload_and_publish(fct_channel_t* control, int* listener,
         return -1;
     }
 
-    if (fsync(writer->fd) == 0 && link(temporary_file, destination) == 0) {
+    if (fsync(writer->fd) == 0 &&
+        linkat(AT_FDCWD, temporary_file, output_fd, meta->filename, 0) == 0 &&
+        fsync(output_fd) == 0) {
         (void)send_result_frame(control, FCT_RESULT_OK, session_token);
         return 0;
     }
@@ -567,7 +577,8 @@ static int receive_payload_and_publish(fct_channel_t* control, int* listener,
     return -1;
 }
 
-static int receive_file(fct_channel_t* control, int* listener, const char* directory) {
+static int receive_file(fct_channel_t* control, int* listener, const char* directory,
+                        int output_fd) {
     fct_file_meta_t meta;
     uint16_t worker_count = 0;
     if (receive_handshake(control, &meta, &worker_count) < 0)
@@ -579,8 +590,7 @@ static int receive_file(fct_channel_t* control, int* listener, const char* direc
     }
 
     file_writer_t writer = {.fd = -1};
-    char* destination = join_path(directory, meta.filename);
-    char* temporary_dir = destination ? join_path(directory, ".fct-XXXXXX") : NULL;
+    char* temporary_dir = join_path(directory, ".fct-XXXXXX");
     char* temporary_file = NULL;
     char* created_dir = temporary_dir ? mkdtemp(temporary_dir) : NULL;
     int result = -1;
@@ -591,7 +601,7 @@ static int receive_file(fct_channel_t* control, int* listener, const char* direc
         if (temporary_file &&
             fw_init(&writer, temporary_file, meta.file_size, meta.chunk_size) == 0) {
             result = receive_payload_and_publish(control, listener, &meta, worker_count, &writer,
-                                                 temporary_file, destination);
+                                                 temporary_file, output_fd);
         } else {
             saved = errno;
             (void)send_result_frame(control, FCT_RESULT_STORAGE_ERROR, NULL);
@@ -611,23 +621,22 @@ static int receive_file(fct_channel_t* control, int* listener, const char* direc
         rmdir(created_dir);
     free(temporary_file);
     free(temporary_dir);
-    free(destination);
     errno = saved;
     return result;
 }
 
 static int run_server(const fct_options_t* options) {
-    struct stat st;
-    if (stat(options->output_dir, &st) < 0)
+    int output_fd = open(options->output_dir, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (output_fd < 0)
         return -1;
-    if (!S_ISDIR(st.st_mode)) {
-        errno = ENOTDIR;
-        return -1;
-    }
 
     int listener = fct_server_listen(options->port);
-    if (listener < 0)
+    if (listener < 0) {
+        int saved = errno;
+        close(output_fd);
+        errno = saved;
         return -1;
+    }
     fprintf(stderr, "Listening on port %d\n", options->port);
     fflush(stderr);
 
@@ -635,13 +644,14 @@ static int run_server(const fct_options_t* options) {
     int result = fct_channel_accept(&channel, listener);
     int saved = errno;
     if (result == 0) {
-        result = receive_file(&channel, &listener, options->output_dir);
+        result = receive_file(&channel, &listener, options->output_dir, output_fd);
         saved = errno;
     }
 
     if (listener >= 0)
         close(listener);
     fct_channel_close(&channel);
+    close(output_fd);
     errno = saved;
     return result;
 }

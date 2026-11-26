@@ -8,7 +8,52 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/resource.h>
+#include <sys/stat.h>
 #include <unistd.h>
+
+static void test_open_existing(const char* directory)
+{
+    file_writer_t writer = {.fd = -1};
+    char path[256];
+    char other[256];
+    snprintf(path, sizeof(path), "%s/partial.bin", directory);
+    snprintf(other, sizeof(other), "%s/other", directory);
+
+    assert(fw_open_existing(&writer, path, 10, 4) == -1);
+    assert(writer.fd == -1 && access(path, F_OK) == -1);
+    assert(fw_init(&writer, path, 10, 4) == 0);
+    assert(fw_write_chunk(&writer, 0, "ABCD", 4) == 4);
+    assert(fw_write_chunk(&writer, 2, "IJ", 2) == 2);
+    fw_close(&writer);
+
+    assert(fw_open_existing(&writer, path, 9, 4) == -1 && writer.fd == -1);
+    assert(fw_open_existing(&writer, path, 11, 4) == -1 && writer.fd == -1);
+    assert(fw_open_existing(&writer, path, 10, 0) == -1 && writer.fd == -1);
+    assert(fw_open_existing(&writer, path, UINT64_MAX, 4) == -1 && writer.fd == -1);
+    assert(fw_open_existing(&writer, directory, 10, 4) == -1 && writer.fd == -1);
+    assert(mkfifo(other, 0600) == 0);
+    assert(fw_open_existing(&writer, other, 0, 4) == -1 && writer.fd == -1);
+    assert(unlink(other) == 0);
+    assert(symlink(path, other) == 0);
+    assert(fw_open_existing(&writer, other, 10, 4) == -1 && writer.fd == -1);
+    assert(unlink(other) == 0);
+
+    assert(fw_open_existing(&writer, path, 10, 4) == 0);
+    assert(writer.file_size == 10 && writer.chunk_size == 4 && writer.total_chunks == 3);
+    assert(fw_write_chunk(&writer, 1, "EFGH", 4) == 4);
+    char buf[10];
+    assert(pread(writer.fd, buf, sizeof(buf), 0) == (ssize_t)sizeof(buf));
+    assert(memcmp(buf, "ABCDEFGHIJ", sizeof(buf)) == 0);
+    fw_close(&writer);
+    assert(unlink(path) == 0);
+
+    assert(fw_init(&writer, path, 0, 4) == 0);
+    fw_close(&writer);
+    assert(fw_open_existing(&writer, path, 0, 4) == 0);
+    assert(writer.total_chunks == 0);
+    fw_close(&writer);
+    assert(unlink(path) == 0);
+}
 
 int main(void)
 {
@@ -17,6 +62,7 @@ int main(void)
     char path[sizeof(directory) + sizeof("/output.bin")];
 
     assert(mkdtemp(directory) != NULL);
+    test_open_existing(directory);
     snprintf(path, sizeof(path), "%s/output.bin", directory);
     assert(fw_init(&writer, path, 10, 4) == 0);
 

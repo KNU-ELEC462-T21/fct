@@ -89,6 +89,45 @@ static void test_clamping_and_abort(void) {
     fclose(out);
 }
 
+static void test_resumed_progress(void) {
+    const uint64_t mib = 1024 * 1024;
+    fct_progress_state_t state;
+    FILE* out = tmpfile();
+    char buf[512];
+    CHECK(out != NULL);
+    CHECK(fct_progress_init(&state, 8 * mib, out) == 0);
+
+    fct_progress_set_resumed(NULL, mib);
+    fct_progress_set_resumed(&state, 3 * mib);
+    fct_progress_set_resumed(&state, 4 * mib);
+    fct_progress_finish(&state);
+    read_stream(out, buf, sizeof(buf));
+    CHECK(strstr(buf, "50.00% | 0.00 MiB/s | Saved: — | ETA: —") != NULL);
+
+    CHECK(fseek(out, 0, SEEK_END) == 0);
+    state.started_at.tv_sec -= 4;
+    fct_progress_on_chunk(&state, 2 * mib, mib);
+    fct_progress_finish(&state);
+    read_stream(out, buf, sizeof(buf));
+    char* partial = strstr(buf, "75.00%");
+    CHECK(partial != NULL);
+    double speed, saved, eta;
+    CHECK(sscanf(partial, "75.00%% | %lf MiB/s | Saved: %lf%% | ETA: %lfs",
+                 &speed, &saved, &eta) == 3);
+    CHECK(speed <= 0.50 && saved == 50.0 && eta >= 4.0);
+
+    CHECK(fseek(out, 0, SEEK_END) == 0);
+    fct_progress_set_resumed(&state, UINT64_MAX);
+    CHECK(state.resumed_bytes == 6 * mib);
+    CHECK(state.completed_bytes == 8 * mib);
+    fct_progress_finish(&state);
+    read_stream(out, buf, sizeof(buf));
+    CHECK(strstr(buf, "100.00%") != NULL);
+    CHECK(strstr(buf, "Saved: 50.0% | ETA: 0.0s") != NULL);
+    fct_progress_destroy(&state);
+    fclose(out);
+}
+
 typedef struct {
     fct_progress_state_t* state;
     int chunks;
@@ -144,6 +183,7 @@ int main(void) {
     test_invalid_args();
     test_empty_file_and_zero_denominators();
     test_clamping_and_abort();
+    test_resumed_progress();
     test_multithreaded_aggregation();
     printf("Progress tests passed!\n");
     return 0;
