@@ -2,6 +2,7 @@
 #include "compress.h"
 
 #include <errno.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -119,9 +120,21 @@ static void test_mode(void) {
           m == FCT_COMPRESS_RAW);
     CHECK(fct_compression_mode("a.zip", text, len, false, NULL, 0, &m) == 0 &&
           m == FCT_COMPRESS_RAW);
+    /* A dotfile named ".zip" has no stem, so it is not treated as a ZIP extension. */
+    CHECK(fct_compression_mode("dir/.zip", text, len, false, scratch, cap, &m) == 0 &&
+          m == FCT_COMPRESS_AUTO);
     memcpy(buf, "PK\x03\x04", 4);
     CHECK(fct_compression_mode("a", buf, sizeof(buf), false, NULL, 0, &m) == 0 &&
           m == FCT_COMPRESS_RAW);
+    memcpy(buf, "PK\x05\x06", 4);
+    CHECK(fct_compression_mode("a", buf, sizeof(buf), false, NULL, 0, &m) == 0 &&
+          m == FCT_COMPRESS_RAW);
+    /* Plain text starting with "PK " must not be misidentified as a ZIP header. */
+    unsigned char* pk_text = make_text(len);
+    memcpy(pk_text, "PK ", 3);
+    CHECK(fct_compression_mode("a.txt", pk_text, len, false, scratch, cap, &m) == 0 &&
+          m == FCT_COMPRESS_AUTO);
+    free(pk_text);
     memcpy(buf, "\x1f\x8b", 2);
     CHECK(fct_compression_mode("a", buf, sizeof(buf), false, NULL, 0, &m) == 0 &&
           m == FCT_COMPRESS_RAW);
@@ -230,6 +243,8 @@ static void test_decode_errors(void) {
     CHECK_FAILS(fct_decode_chunk(0, text, len - 1, out, len), EPROTO);  /* raw length mismatch */
     CHECK_FAILS(fct_decode_chunk(2, text, len, out, len), EPROTO);      /* unknown flag */
     CHECK_FAILS(fct_decode_chunk(0, text, len, text + 1, len), EINVAL); /* overlapping buffers */
+    CHECK_FAILS(fct_decode_chunk(0, text, SIZE_MAX, text, 1), EINVAL);
+    CHECK_FAILS(fct_decode_chunk(0, text, SIZE_MAX, text + 1, 1), EINVAL);
     CHECK_FAILS(fct_decode_chunk(0, NULL, 1, out, 1), EINVAL);
 
     free(text);

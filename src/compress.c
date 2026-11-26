@@ -1,3 +1,5 @@
+#define _POSIX_C_SOURCE 200809L
+
 #include "compress.h"
 
 #include "common.h"
@@ -39,7 +41,7 @@ static int deflate_into(const void* src, size_t raw_len, void* scratch, size_t c
         return -1;
     }
 
-    uLongf len = (uLongf)capacity;
+    uLongf len = (uLongf)bound;
     int status =
         compress2((Bytef*)scratch, &len, (const Bytef*)src, (uLong)raw_len, FCT_ZLIB_LEVEL);
     if (status != Z_OK) {
@@ -53,10 +55,14 @@ static int deflate_into(const void* src, size_t raw_len, void* scratch, size_t c
 /* True when the name ends in an extension of an already compressed format. */
 static bool has_compressed_extension(const char* filename) {
     static const char* const exts[] = {".zip", ".gz", ".tgz", ".mp4"};
+    const char* slash;
     size_t name_len;
 
     if (!filename)
         return false;
+    slash = strrchr(filename, '/');
+    if (slash)
+        filename = slash + 1;
     name_len = strlen(filename);
     for (size_t i = 0; i < sizeof(exts) / sizeof(exts[0]); i++) {
         size_t ext_len = strlen(exts[i]);
@@ -68,7 +74,9 @@ static bool has_compressed_extension(const char* filename) {
 
 /* True when the data starts with a ZIP, GZIP or MP4 signature. */
 static bool has_compressed_signature(const unsigned char* data, size_t len) {
-    if (len >= 2 && data[0] == 'P' && data[1] == 'K')
+    if (len >= 4 && data[0] == 'P' && data[1] == 'K' &&
+        ((data[2] == 0x03 && data[3] == 0x04) || (data[2] == 0x05 && data[3] == 0x06) ||
+         (data[2] == 0x07 && data[3] == 0x08)))
         return true; /* ZIP */
     if (len >= 2 && data[0] == 0x1f && data[1] == 0x8b)
         return true; /* GZIP */
@@ -158,7 +166,7 @@ int fct_decode_chunk(uint32_t flags, const void* payload, size_t payload_len, vo
     /* dst and payload must not overlap. */
     if (payload_len > 0 && expected_len > 0) {
         uintptr_t p = (uintptr_t)payload, d = (uintptr_t)dst;
-        if (p < d + expected_len && d < p + payload_len) {
+        if (p < d ? d - p < payload_len : p - d < expected_len) {
             errno = EINVAL;
             return -1;
         }
