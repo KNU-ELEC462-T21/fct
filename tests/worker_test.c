@@ -171,8 +171,8 @@ typedef struct {
 static void* send_thread_entry(void* arg) {
     send_thread_args_t* a = arg;
     errno = 0;
-    a->rc =
-        fct_send_parallel(a->channels, a->channel_count, a->reader, a->meta, a->mode, a->progress);
+    a->rc = fct_send_parallel(a->channels, a->channel_count, a->reader, a->meta, a->mode, NULL,
+                              false, a->progress);
     a->err = errno;
     return NULL;
 }
@@ -227,7 +227,8 @@ static void run_parallel_roundtrip(const char* dir, uint64_t file_size, uint32_t
     assert(pthread_create(&sthread, NULL, send_thread_entry, &sargs) == 0);
 
     fct_result_t result = FCT_RESULT_TRANSFER_ERROR;
-    int rrc = fct_receive_parallel(servers, n_workers, &writer, &meta, &recv_prog, &result);
+    int rrc =
+        fct_receive_parallel(servers, n_workers, &writer, &meta, NULL, &recv_prog, NULL, &result);
     assert(pthread_join(sthread, NULL) == 0);
 
     assert(sargs.rc == 0);
@@ -294,17 +295,18 @@ static void test_empty_file_n0(const char* dir) {
     fct_file_meta_t meta = make_meta(0, DEFAULT_CHUNK_SZ, "empty.bin");
     fct_result_t result = FCT_RESULT_PROTOCOL_ERROR;
 
-    assert(fct_send_parallel(NULL, 0, &reader, &meta, FCT_COMPRESS_RAW, NULL) == 0);
-    assert(fct_receive_parallel(NULL, 0, &writer, &meta, NULL, &result) == 0);
+    assert(fct_send_parallel(NULL, 0, &reader, &meta, FCT_COMPRESS_RAW, NULL, false, NULL) == 0);
+    assert(fct_receive_parallel(NULL, 0, &writer, &meta, NULL, NULL, NULL, &result) == 0);
     assert(result == FCT_RESULT_OK);
 
     /* Non-zero channel_count must be rejected for empty files. */
     fct_channel_t dummy = {.sockfd = 0};
     errno = 0;
-    assert(fct_send_parallel(&dummy, 1, &reader, &meta, FCT_COMPRESS_RAW, NULL) == -1 &&
+    assert(fct_send_parallel(&dummy, 1, &reader, &meta, FCT_COMPRESS_RAW, NULL, false, NULL) ==
+               -1 &&
            errno == EINVAL);
     errno = 0;
-    assert(fct_receive_parallel(&dummy, 1, &writer, &meta, NULL, &result) == -1 &&
+    assert(fct_receive_parallel(&dummy, 1, &writer, &meta, NULL, NULL, NULL, &result) == -1 &&
            errno == EINVAL && result == FCT_RESULT_PROTOCOL_ERROR);
 
     fr_close(&reader);
@@ -381,7 +383,7 @@ static void test_out_of_order_assembly(const char* dir) {
         assert(shutdown(clients[i].sockfd, SHUT_WR) == 0);
 
     fct_result_t result = FCT_RESULT_TRANSFER_ERROR;
-    assert(fct_receive_parallel(servers, 4, &writer, &meta, NULL, &result) == 0);
+    assert(fct_receive_parallel(servers, 4, &writer, &meta, NULL, NULL, NULL, &result) == 0);
     assert(result == FCT_RESULT_OK);
 
     close_channels(4, clients);
@@ -433,7 +435,7 @@ static void test_duplicate_and_missing_chunks(const char* dir) {
 
     fct_result_t result = FCT_RESULT_OK;
     errno = 0;
-    assert(fct_receive_parallel(servers, 2, &writer, &meta, NULL, &result) == -1);
+    assert(fct_receive_parallel(servers, 2, &writer, &meta, NULL, NULL, NULL, &result) == -1);
     assert(result == FCT_RESULT_PROTOCOL_ERROR);
     assert(errno == EPROTO);
 
@@ -454,7 +456,7 @@ static void test_duplicate_and_missing_chunks(const char* dir) {
 
     result = FCT_RESULT_OK;
     errno = 0;
-    assert(fct_receive_parallel(servers, 2, &writer, &meta, NULL, &result) == -1);
+    assert(fct_receive_parallel(servers, 2, &writer, &meta, NULL, NULL, NULL, &result) == -1);
     assert(result == FCT_RESULT_PROTOCOL_ERROR);
     assert(errno == EPROTO);
 
@@ -481,7 +483,7 @@ static void test_protocol_errors_and_decode_failures(const char* dir) {
     send_raw_chunk_manual(&client, 3, 3U * chunk_size, 100U, 'X');
     shutdown(client.sockfd, SHUT_WR);
     errno = 0;
-    assert(fct_receive_parallel(&server, 1, &writer, &meta, NULL, &result) == -1);
+    assert(fct_receive_parallel(&server, 1, &writer, &meta, NULL, NULL, NULL, &result) == -1);
     assert(result == FCT_RESULT_PROTOCOL_ERROR && errno == EPROTO);
     close_channels(1, &client);
     close_channels(1, &server);
@@ -494,7 +496,7 @@ static void test_protocol_errors_and_decode_failures(const char* dir) {
     send_raw_chunk_manual(&client, 1, 0, chunk_size, 'X');
     shutdown(client.sockfd, SHUT_WR);
     errno = 0;
-    assert(fct_receive_parallel(&server, 1, &writer, &meta, NULL, &result) == -1);
+    assert(fct_receive_parallel(&server, 1, &writer, &meta, NULL, NULL, NULL, &result) == -1);
     assert(result == FCT_RESULT_PROTOCOL_ERROR && errno == EPROTO);
     close_channels(1, &client);
     close_channels(1, &server);
@@ -507,7 +509,7 @@ static void test_protocol_errors_and_decode_failures(const char* dir) {
     send_raw_chunk_manual(&client, 2, 2U * chunk_size, 200U, 'X');
     shutdown(client.sockfd, SHUT_WR);
     errno = 0;
-    assert(fct_receive_parallel(&server, 1, &writer, &meta, NULL, &result) == -1);
+    assert(fct_receive_parallel(&server, 1, &writer, &meta, NULL, NULL, NULL, &result) == -1);
     assert(result == FCT_RESULT_PROTOCOL_ERROR && errno == EPROTO);
     close_channels(1, &client);
     close_channels(1, &server);
@@ -531,7 +533,7 @@ static void test_protocol_errors_and_decode_failures(const char* dir) {
     free(bad_buf);
     shutdown(client.sockfd, SHUT_WR);
     errno = 0;
-    assert(fct_receive_parallel(&server, 1, &writer, &meta, NULL, &result) == -1);
+    assert(fct_receive_parallel(&server, 1, &writer, &meta, NULL, NULL, NULL, &result) == -1);
     assert(result == FCT_RESULT_PROTOCOL_ERROR && errno == EPROTO);
     close_channels(1, &client);
     close_channels(1, &server);
@@ -552,7 +554,7 @@ static void test_protocol_errors_and_decode_failures(const char* dir) {
     assert(fct_channel_send_chunk_idle(&client, &hdr, corrupt, 2000) == 0);
     shutdown(client.sockfd, SHUT_WR);
     errno = 0;
-    assert(fct_receive_parallel(&server, 1, &writer, &meta, NULL, &result) == -1);
+    assert(fct_receive_parallel(&server, 1, &writer, &meta, NULL, NULL, NULL, &result) == -1);
     assert(result == FCT_RESULT_PROTOCOL_ERROR && errno == EBADMSG);
     close_channels(1, &client);
     close_channels(1, &server);
@@ -582,7 +584,7 @@ static void test_protocol_errors_and_decode_failures(const char* dir) {
     shutdown(client.sockfd, SHUT_WR);
     compress_stub_set_decode_errno(ENOMEM);
     errno = 0;
-    assert(fct_receive_parallel(&server, 1, &writer, &meta, NULL, &result) == -1);
+    assert(fct_receive_parallel(&server, 1, &writer, &meta, NULL, NULL, NULL, &result) == -1);
     compress_stub_reset();
     assert(result == FCT_RESULT_TRANSFER_ERROR && errno == ENOMEM);
     close_channels(1, &client);
@@ -600,7 +602,7 @@ static void test_protocol_errors_and_decode_failures(const char* dir) {
     assert(send_exact(client.sockfd, partial_wire, sizeof(partial_wire)) == 0);
     shutdown(client.sockfd, SHUT_WR);
     errno = 0;
-    assert(fct_receive_parallel(&server, 1, &writer, &meta, NULL, &result) == -1);
+    assert(fct_receive_parallel(&server, 1, &writer, &meta, NULL, NULL, NULL, &result) == -1);
     assert(result == FCT_RESULT_PROTOCOL_ERROR && errno == EPROTO);
     close_channels(1, &client);
     close_channels(1, &server);
@@ -630,7 +632,7 @@ static void test_storage_error(const char* dir) {
 
     fct_result_t result = FCT_RESULT_OK;
     errno = 0;
-    assert(fct_receive_parallel(&server, 1, &writer, &meta, NULL, &result) == -1);
+    assert(fct_receive_parallel(&server, 1, &writer, &meta, NULL, NULL, NULL, &result) == -1);
     assert(result == FCT_RESULT_STORAGE_ERROR && errno == EBADF);
 
     close_channels(1, &client);
@@ -661,7 +663,7 @@ static void test_multi_worker_wakeup_and_transfer_error(const char* dir) {
     uint64_t start_ms = monotonic_ms();
     fct_result_t result = FCT_RESULT_OK;
     errno = 0;
-    assert(fct_receive_parallel(servers, 4, &writer, &meta, NULL, &result) == -1);
+    assert(fct_receive_parallel(servers, 4, &writer, &meta, NULL, NULL, NULL, &result) == -1);
     uint64_t elapsed_ms = monotonic_ms() - start_ms;
     assert(result == FCT_RESULT_PROTOCOL_ERROR && errno == EPROTO);
     assert(elapsed_ms < 2000ULL);
@@ -683,7 +685,7 @@ static void test_multi_worker_wakeup_and_transfer_error(const char* dir) {
     start_ms = monotonic_ms();
     result = FCT_RESULT_OK;
     errno = 0;
-    assert(fct_receive_parallel(servers, 4, &writer, &meta, NULL, &result) == -1);
+    assert(fct_receive_parallel(servers, 4, &writer, &meta, NULL, NULL, NULL, &result) == -1);
     elapsed_ms = monotonic_ms() - start_ms;
     assert(result == FCT_RESULT_TRANSFER_ERROR && errno == ECONNRESET);
     assert(elapsed_ms < 2000ULL);
@@ -702,7 +704,8 @@ static void test_multi_worker_wakeup_and_transfer_error(const char* dir) {
     compress_stub_set_encode_errno(EIO);
     start_ms = monotonic_ms();
     errno = 0;
-    assert(fct_send_parallel(clients, 4, &reader, &meta, FCT_COMPRESS_AUTO, NULL) == -1);
+    assert(fct_send_parallel(clients, 4, &reader, &meta, FCT_COMPRESS_AUTO, NULL, false, NULL) ==
+           -1);
     elapsed_ms = monotonic_ms() - start_ms;
     compress_stub_reset();
     assert(errno == EIO);
@@ -749,7 +752,7 @@ static void test_single_channel_failure_result_exchange(const char* dir) {
 
     fct_result_t result = FCT_RESULT_OK;
     errno = 0;
-    assert(fct_receive_parallel(&server, 1, &writer, &meta, NULL, &result) == -1);
+    assert(fct_receive_parallel(&server, 1, &writer, &meta, NULL, NULL, NULL, &result) == -1);
     assert(result == FCT_RESULT_PROTOCOL_ERROR && errno == EPROTO);
 
     /* Server must still be able to write RESULT on the shared N=1 channel. */
