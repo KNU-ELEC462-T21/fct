@@ -61,6 +61,15 @@ static uint32_t count_bits(const uint8_t* bits, size_t byte_len) {
     return n;
 }
 
+/* Copy a 256-byte filename field up to its first NUL and zero the rest, so bytes
+ * after the terminator never affect what is stored or compared. */
+static void normalize_filename(uint8_t dst[FILENAME_SIZE], const char* src) {
+    size_t n = strnlen(src, FILENAME_SIZE);
+
+    memset(dst, 0, FILENAME_SIZE);
+    memcpy(dst, src, n);
+}
+
 size_t fct_bitmap_byte_len(uint32_t total_chunks) {
     return ((size_t)total_chunks + 7) / 8;
 }
@@ -213,7 +222,7 @@ int fct_bitmap_save_file(const fct_bitmap_t* bm, const fct_file_meta_t* meta, co
     p += 24;
     memcpy(p, meta->file_sha256, FCT_SHA256_SIZE);
     p += FCT_SHA256_SIZE;
-    memcpy(p, meta->filename, FILENAME_SIZE);
+    normalize_filename(p, meta->filename);
     p += FILENAME_SIZE;
     put32(p, (uint32_t)bm->byte_len);
     p += 4;
@@ -294,6 +303,10 @@ int fct_bitmap_load_file(fct_bitmap_t* bm, const fct_file_meta_t* expected_meta,
     if (err == 0) {
         const uint8_t* p = buf;
         const uint8_t* bits = buf + HEADER_SIZE;
+        uint8_t stored_name[FILENAME_SIZE], expected_name[FILENAME_SIZE];
+
+        normalize_filename(stored_name, (const char*)(p + 24 + FCT_SHA256_SIZE));
+        normalize_filename(expected_name, expected_meta->filename);
 
         /* Check integrity first, then that the file belongs to this transfer. */
         if (get32(buf + total - TRAILER_SIZE) != fct_crc32(buf, total - TRAILER_SIZE) ||
@@ -302,7 +315,7 @@ int fct_bitmap_load_file(fct_bitmap_t* bm, const fct_file_meta_t* expected_meta,
             get32(p + 16) != expected_meta->chunk_size ||
             get32(p + 20) != expected_meta->total_chunks ||
             memcmp(p + 24, expected_meta->file_sha256, FCT_SHA256_SIZE) != 0 ||
-            memcmp(p + 24 + FCT_SHA256_SIZE, expected_meta->filename, FILENAME_SIZE) != 0 ||
+            memcmp(stored_name, expected_name, FILENAME_SIZE) != 0 ||
             get32(p + HEADER_SIZE - 4) != byte_len ||
             !trailing_bits_clear(bits, byte_len, expected_meta->total_chunks)) {
             err = EPROTO;

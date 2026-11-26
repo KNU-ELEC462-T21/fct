@@ -209,6 +209,10 @@ static void test_file_roundtrip(void) {
     other.file_sha256[31] ^= 1;
     CHECK_FAILS(fct_bitmap_load_file(&loaded, &other, path), EPROTO);
     other = meta;
+    memset(other.filename + 10, 'x', 50); /* junk after the NUL is ignored */
+    CHECK(fct_bitmap_load_file(&loaded, &other, path) == 0);
+    fct_bitmap_free(&loaded);
+    other = meta;
     other.filename[0] = 'M';
     CHECK_FAILS(fct_bitmap_load_file(&loaded, &other, path), EPROTO);
     other = make_meta(10);
