@@ -149,6 +149,34 @@ static void test_mode(void) {
     CHECK_FAILS(fct_compression_mode("a.txt", text, DEFAULT_CHUNK_SZ + 1, false, scratch, cap, &m),
                 EINVAL);
 
+    fct_compression_reason_t r;
+    CHECK(fct_compression_mode_ex("a.txt", noise, len, true, NULL, 0, &m, &r) == 0 &&
+          m == FCT_COMPRESS_FORCE && r == FCT_COMPRESS_REASON_FORCE);
+    CHECK(fct_compression_mode_ex("empty.txt", NULL, 0, false, NULL, 0, &m, &r) == 0 &&
+          m == FCT_COMPRESS_RAW && r == FCT_COMPRESS_REASON_EMPTY);
+    CHECK(fct_compression_mode_ex("a.zip", text, len, false, NULL, 0, &m, &r) == 0 &&
+          m == FCT_COMPRESS_RAW && r == FCT_COMPRESS_REASON_COMPRESSED_FORMAT);
+    memcpy(buf, "\x1f\x8b", 2);
+    CHECK(fct_compression_mode_ex("a", buf, sizeof(buf), false, NULL, 0, &m, &r) == 0 &&
+          m == FCT_COMPRESS_RAW && r == FCT_COMPRESS_REASON_COMPRESSED_FORMAT);
+    CHECK(fct_compression_mode_ex("a.txt", text, len, false, scratch, cap, &m, &r) == 0 &&
+          m == FCT_COMPRESS_AUTO && r == FCT_COMPRESS_REASON_AUTO);
+    CHECK(fct_compression_mode_ex("a.bin", noise, len, false, scratch, cap, &m, &r) == 0 &&
+          m == FCT_COMPRESS_RAW && r == FCT_COMPRESS_REASON_LOW_RATIO);
+    CHECK(fct_compression_mode_ex("a.txt", text, len, false, scratch, cap, &m, NULL) == 0 &&
+          m == FCT_COMPRESS_AUTO);
+    CHECK_FAILS(fct_compression_mode_ex("a.txt", text, len, false, scratch, cap, NULL, &r),
+                EINVAL);
+
+    CHECK(strcmp(fct_compression_reason_str(FCT_COMPRESS_REASON_AUTO), "ON (auto)") == 0);
+    CHECK(strcmp(fct_compression_reason_str(FCT_COMPRESS_REASON_FORCE), "ON (force)") == 0);
+    CHECK(strcmp(fct_compression_reason_str(FCT_COMPRESS_REASON_EMPTY), "OFF (empty)") == 0);
+    CHECK(strcmp(fct_compression_reason_str(FCT_COMPRESS_REASON_COMPRESSED_FORMAT),
+                 "OFF (compressed format)") == 0);
+    CHECK(strcmp(fct_compression_reason_str(FCT_COMPRESS_REASON_LOW_RATIO), "OFF (low ratio)") ==
+          0);
+    CHECK(strcmp(fct_compression_reason_str((fct_compression_reason_t)99), "unknown") == 0);
+
     free(text);
     free(noise);
     free(scratch);
@@ -186,13 +214,14 @@ static void test_ratio_boundary(void) {
     CHECK(k > 0 && k < len);
 
     /* k random bytes: just over 95%, so RAW. */
-    CHECK(fct_compression_mode("a.bin", buf, len, false, scratch, cap, &m) == 0 &&
-          m == FCT_COMPRESS_RAW);
+    fct_compression_reason_t r;
+    CHECK(fct_compression_mode_ex("a.bin", buf, len, false, scratch, cap, &m, &r) == 0 &&
+          m == FCT_COMPRESS_RAW && r == FCT_COMPRESS_REASON_LOW_RATIO);
     /* k - 1 random bytes: at most 95%, so AUTO. */
     buf[k - 1] = 0;
     CHECK(forced_size(buf, len, scratch, cap) * 100 <= len * 95);
-    CHECK(fct_compression_mode("a.bin", buf, len, false, scratch, cap, &m) == 0 &&
-          m == FCT_COMPRESS_AUTO);
+    CHECK(fct_compression_mode_ex("a.bin", buf, len, false, scratch, cap, &m, &r) == 0 &&
+          m == FCT_COMPRESS_AUTO && r == FCT_COMPRESS_REASON_AUTO);
 
     free(noise);
     free(buf);

@@ -180,10 +180,43 @@ static void test_multithreaded_aggregation(void) {
     fclose(out);
 }
 
+static void test_newline(void) {
+    fct_progress_state_t state;
+    FILE* out = tmpfile();
+    char buf[512];
+    CHECK(out != NULL);
+
+    fct_progress_newline(NULL);
+    CHECK(fct_progress_init(&state, 1000, out) == 0);
+    fct_progress_newline(&state);
+    read_stream(out, buf, sizeof(buf));
+    CHECK(buf[0] == '\0');
+
+    state.last_print.tv_sec -= 2;
+    fct_progress_on_chunk(&state, 500, 250);
+    CHECK(state.has_printed);
+    fct_progress_newline(&state);
+    CHECK(!state.has_printed);
+
+    read_stream(out, buf, sizeof(buf));
+    size_t len = strlen(buf);
+    CHECK(len > 0 && buf[len - 1] == '\n');
+
+    /* Second newline and abort must not emit extra blank lines. */
+    fct_progress_newline(&state);
+    fct_progress_abort(&state);
+    read_stream(out, buf, sizeof(buf));
+    CHECK(strlen(buf) == len);
+
+    fct_progress_destroy(&state);
+    fclose(out);
+}
+
 int main(void) {
     test_invalid_args();
     test_empty_file_and_zero_denominators();
     test_clamping_and_abort();
+    test_newline();
     test_resumed_progress();
     test_multithreaded_aggregation();
     printf("Progress tests passed!\n");

@@ -31,6 +31,8 @@ void fct_progress_on_chunk(void* context, size_t raw_len, size_t payload_len);
 
 void fct_progress_finish(fct_progress_state_t* state);
 
+void fct_progress_newline(fct_progress_state_t* state);
+
 void fct_progress_abort(fct_progress_state_t* state);
 
 void fct_progress_destroy(fct_progress_state_t* state);

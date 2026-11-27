@@ -31,8 +31,7 @@ static void print_progress(fct_progress_state_t* state, const struct timespec* n
 
     char saved_str[32];
     if (session_bytes > 0) {
-        double saved =
-            100.0 * (1.0 - (double)state->payload_bytes / (double)session_bytes);
+        double saved = 100.0 * (1.0 - (double)state->payload_bytes / (double)session_bytes);
         snprintf(saved_str, sizeof(saved_str), "%.1f%%", saved);
     } else {
         snprintf(saved_str, sizeof(saved_str), "—");
@@ -138,7 +137,7 @@ void fct_progress_finish(fct_progress_state_t* state) {
     pthread_mutex_unlock(&state->mutex);
 }
 
-void fct_progress_abort(fct_progress_state_t* state) {
+void fct_progress_newline(fct_progress_state_t* state) {
     if (!state)
         return;
 
@@ -146,8 +145,13 @@ void fct_progress_abort(fct_progress_state_t* state) {
     if (state->has_printed) {
         fputc('\n', state->output);
         fflush(state->output);
+        state->has_printed = false;
     }
     pthread_mutex_unlock(&state->mutex);
+}
+
+void fct_progress_abort(fct_progress_state_t* state) {
+    fct_progress_newline(state);
 }
 
 void fct_progress_destroy(fct_progress_state_t* state) {

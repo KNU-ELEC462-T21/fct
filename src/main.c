@@ -4,6 +4,8 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
+#include <pthread.h>
+#include <signal.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -158,10 +160,48 @@ static void close_channels(fct_channel_t* channels, size_t count) {
         fct_channel_close(&channels[i]);
 }
 
+static void format_bytes(uint64_t bytes, char* buf, size_t cap) {
+    static const uint64_t gib = 1024ULL * 1024ULL * 1024ULL;
+    static const uint64_t mib = 1024ULL * 1024ULL;
+    static const uint64_t kib = 1024ULL;
+
+    if (bytes >= gib)
+        snprintf(buf, cap, "%.2f GiB", (double)bytes / (double)gib);
+    else if (bytes >= mib)
+        snprintf(buf, cap, "%.2f MiB", (double)bytes / (double)mib);
+    else if (bytes >= kib)
+        snprintf(buf, cap, "%.2f KiB", (double)bytes / (double)kib);
+    else
+        snprintf(buf, cap, "%llu B", (unsigned long long)bytes);
+}
+
+typedef struct {
+    pthread_mutex_t mu;
+    uint64_t chunks;
+    uint64_t compressed_chunks;
+    uint64_t raw_bytes;
+    uint64_t payload_bytes;
+} recv_stats_t;
+
+static void recv_stats_on_chunk(void* context, size_t raw_len, size_t payload_len,
+                                bool compressed) {
+    recv_stats_t* stats = context;
+    if (!stats)
+        return;
+    pthread_mutex_lock(&stats->mu);
+    stats->chunks++;
+    if (compressed)
+        stats->compressed_chunks++;
+    stats->raw_bytes += raw_len;
+    stats->payload_bytes += payload_len;
+    pthread_mutex_unlock(&stats->mu);
+}
+
 static int determine_compression_mode(file_reader_t* reader, const fct_file_meta_t* meta,
-                                      bool force, fct_compression_mode_t* mode) {
+                                      bool force, fct_compression_mode_t* mode,
+                                      fct_compression_reason_t* reason) {
     if (meta->total_chunks == 0)
-        return fct_compression_mode(meta->filename, NULL, 0, force, NULL, 0, mode);
+        return fct_compression_mode_ex(meta->filename, NULL, 0, force, NULL, 0, mode, reason);
 
     void* first_chunk = malloc(meta->chunk_size);
     if (!first_chunk)
@@ -171,14 +211,14 @@ static int determine_compression_mode(file_reader_t* reader, const fct_file_meta
     ssize_t first_len = fr_read_chunk(reader, 0, first_chunk);
     if (first_len >= 0) {
         if (force) {
-            result = fct_compression_mode(meta->filename, first_chunk, (size_t)first_len, true,
-                                          NULL, 0, mode);
+            result = fct_compression_mode_ex(meta->filename, first_chunk, (size_t)first_len, true,
+                                             NULL, 0, mode, reason);
         } else {
             size_t cap = fct_compress_bound((size_t)first_len);
             void* scratch = cap > 0 ? malloc(cap) : NULL;
             if (cap > 0 && scratch != NULL) {
-                result = fct_compression_mode(meta->filename, first_chunk, (size_t)first_len, false,
-                                              scratch, cap, mode);
+                result = fct_compression_mode_ex(meta->filename, first_chunk, (size_t)first_len,
+                                                 false, scratch, cap, mode, reason);
             }
             int saved = errno;
             free(scratch);
@@ -332,7 +372,8 @@ static uint64_t resumed_bytes(const fct_file_meta_t* meta, const fct_bitmap_t* b
 static int send_rounds(fct_channel_t* control, fct_channel_t* channels, uint16_t worker_count,
                        const uint8_t token[FCT_TRANSFER_TOKEN_SIZE], file_reader_t* reader,
                        const fct_file_meta_t* meta, fct_compression_mode_t mode,
-                       fct_bitmap_t* completed, const fct_progress_t* progress) {
+                       fct_bitmap_t* completed, fct_progress_state_t* progress_state,
+                       const fct_progress_t* progress) {
     for (unsigned round = 0;; ++round) {
         if (fct_send_parallel(channels, worker_count, reader, meta, mode, completed, round != 0,
                               progress) < 0) {
@@ -374,13 +415,20 @@ static int send_rounds(fct_channel_t* control, fct_channel_t* channels, uint16_t
         }
         fct_bitmap_free(completed);
         *completed = updated;
+
+        uint32_t resend = fct_bitmap_missing(completed);
+        fct_progress_newline(progress_state);
+        fprintf(stderr, "Retry %u/%u: resending %u %s\n", frame.arg, FCT_MAX_CHUNK_RETRIES, resend,
+                resend == 1 ? "chunk" : "chunks");
+        fflush(stderr);
     }
     errno = EPROTO;
     return -1;
 }
 
 static int send_session(const fct_options_t* options, file_reader_t* reader,
-                        const fct_file_meta_t* meta, fct_compression_mode_t mode) {
+                        const fct_file_meta_t* meta, fct_compression_mode_t mode,
+                        fct_compression_reason_t reason) {
     uint16_t worker_count = compute_worker_count(options->worker_count, meta->total_chunks);
     fct_channel_t control = {.sockfd = -1};
     fct_channel_t data_channels[FCT_MAX_DATA_WORKERS];
@@ -403,20 +451,43 @@ static int send_session(const fct_options_t* options, file_reader_t* reader,
     fct_progress_state_t progress;
     if (fct_progress_init(&progress, meta->file_size, stderr) < 0)
         goto done;
-    fct_progress_set_resumed(&progress, resumed_bytes(meta, &completed));
+    uint64_t already_bytes = resumed_bytes(meta, &completed);
+    fct_progress_set_resumed(&progress, already_bytes);
     fct_progress_t cb = {.on_chunk = fct_progress_on_chunk, .context = &progress};
+
+    char size_buf[32];
+    format_bytes(meta->file_size, size_buf, sizeof(size_buf));
+    fprintf(stderr, "Sending '%s' (%s, %u %s) to %s:%d\n", meta->filename, size_buf,
+            meta->total_chunks, meta->total_chunks == 1 ? "chunk" : "chunks", options->server_ip,
+            options->port);
+    if ((int)worker_count != options->worker_count)
+        fprintf(stderr, "Workers: %u (requested %d)\n", worker_count, options->worker_count);
+    else
+        fprintf(stderr, "Workers: %u\n", worker_count);
+    uint32_t resumed_chunks = fct_bitmap_completed(&completed);
+    if (resumed_chunks > 0) {
+        double pct =
+            meta->file_size > 0 ? 100.0 * (double)already_bytes / (double)meta->file_size : 100.0;
+        fprintf(stderr, "Resuming: %u/%u chunks (%.2f%%)\n", resumed_chunks, meta->total_chunks,
+                pct);
+    }
+    fprintf(stderr, "Compression: %s\n", fct_compression_reason_str(reason));
+    fflush(stderr);
 
     if (worker_count < 2 || open_data_channels(options, worker_count, token, data_channels) == 0) {
         fct_channel_t* channels = worker_count < 2 ? &control : data_channels;
         result = send_rounds(&control, channels, worker_count, token, reader, meta, mode,
-                             &completed, &cb);
+                             &completed, &progress, &cb);
     }
 
     int saved = errno;
-    if (result == 0)
+    if (result == 0) {
         fct_progress_finish(&progress);
-    else
+        fprintf(stderr, "Transfer complete (SHA-256 verified)\n");
+        fflush(stderr);
+    } else {
         fct_progress_abort(&progress);
+    }
     fct_progress_destroy(&progress);
     errno = saved;
 
@@ -452,12 +523,14 @@ static int send_file(const fct_options_t* options) {
     meta.total_chunks = reader.total_chunks;
 
     fct_compression_mode_t mode = FCT_COMPRESS_RAW;
+    fct_compression_reason_t reason = FCT_COMPRESS_REASON_EMPTY;
     int result = -1;
     if (fct_bitmap_byte_len(meta.total_chunks) > FCT_MAX_BITMAP_BYTES) {
         errno = EFBIG;
     } else if (fct_sha256_fd(reader.fd, meta.file_size, meta.file_sha256) == 0 &&
-               determine_compression_mode(&reader, &meta, options->force_compression, &mode) == 0)
-        result = send_session(options, &reader, &meta, mode);
+               determine_compression_mode(&reader, &meta, options->force_compression, &mode,
+                                          &reason) == 0)
+        result = send_session(options, &reader, &meta, mode, reason);
 
     int saved = errno;
     fr_close(&reader);
@@ -574,11 +647,12 @@ typedef struct {
 } receive_session_t;
 
 static int open_receive_session(receive_session_t* session, const fct_file_meta_t* meta,
-                                int output_fd, bool* discard_session) {
+                                int output_fd, bool* discard_session, bool* discarded_corrupt) {
+    *discarded_corrupt = false;
     /* Keep different versions of the same filename in independent sessions. */
     char geometry[64];
-    int len = snprintf(geometry, sizeof(geometry), "%llu/%u/",
-                       (unsigned long long)meta->file_size, meta->chunk_size);
+    int len = snprintf(geometry, sizeof(geometry), "%llu/%u/", (unsigned long long)meta->file_size,
+                       meta->chunk_size);
     fct_sha256_ctx_t hash;
     uint8_t digest[FCT_SHA256_SIZE];
     fct_sha256_init(&hash);
@@ -591,8 +665,8 @@ static int open_receive_session(receive_session_t* session, const fct_file_meta_
 
     if (mkdirat(output_fd, session->name, 0700) < 0 && errno != EEXIST)
         return -1;
-    session->dir_fd = openat(output_fd, session->name,
-                             O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    session->dir_fd =
+        openat(output_fd, session->name, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
     if (session->dir_fd < 0 || flock(session->dir_fd, LOCK_EX | LOCK_NB) < 0)
         return -1;
 
@@ -600,8 +674,8 @@ static int open_receive_session(receive_session_t* session, const fct_file_meta_
     if (fstat(session->dir_fd, &opened) < 0 ||
         fstatat(output_fd, session->name, &named, AT_SYMLINK_NOFOLLOW) < 0)
         return -1;
-    if (opened.st_uid != geteuid() || (opened.st_mode & 077) ||
-        opened.st_dev != named.st_dev || opened.st_ino != named.st_ino) {
+    if (opened.st_uid != geteuid() || (opened.st_mode & 077) || opened.st_dev != named.st_dev ||
+        opened.st_ino != named.st_ino) {
         errno = EACCES;
         return -1;
     }
@@ -637,6 +711,7 @@ static int open_receive_session(receive_session_t* session, const fct_file_meta_
         /* Invalidate the old bitmap durably before replacing its data. */
         if (unlinkat(session->dir_fd, CHECKPOINT_NAME, 0) < 0 || fsync(session->dir_fd) < 0)
             return -1;
+        *discarded_corrupt = true;
     } else if (errno != ENOENT) {
         return -1;
     }
@@ -664,17 +739,17 @@ static int send_bitmap_frame(fct_channel_t* control, const fct_control_frame_t* 
     if (make_deadline(FCT_CONTROL_IO_TIMEOUT_MS, &deadline) < 0 ||
         fct_channel_send_control_until(control, frame, &deadline) < 0)
         return -1;
-    return fct_channel_send_bitmap_until(control, completed->bits, completed->byte_len,
-                                         &deadline);
+    return fct_channel_send_bitmap_until(control, completed->bits, completed->byte_len, &deadline);
 }
 
 static int receive_rounds(fct_channel_t* control, fct_channel_t* channels, uint16_t worker_count,
                           fct_control_frame_t frame, const fct_file_meta_t* meta,
-                          receive_session_t* session, int output_fd, fct_result_t* result) {
+                          receive_session_t* session, int output_fd, const fct_progress_t* progress,
+                          fct_result_t* result) {
     for (unsigned round = 0;; ++round) {
         uint32_t before = fct_bitmap_completed(&session->completed);
         int rc = fct_receive_parallel(channels, worker_count, &session->writer, meta,
-                                      &session->completed, NULL, NULL, result);
+                                      &session->completed, progress, NULL, result);
         int saved = errno;
 
         /* Workers have joined, so the bitmap only describes complete writes. */
@@ -698,17 +773,22 @@ static int receive_rounds(fct_channel_t* control, fct_channel_t* channels, uint1
             *result = FCT_RESULT_TRANSFER_ERROR;
             return -1;
         }
+        uint32_t missing = fct_bitmap_missing(&session->completed);
+        fprintf(stderr, "Retry %u/%u: requesting %u %s (CRC32 mismatch)\n", frame.arg,
+                FCT_MAX_CHUNK_RETRIES, missing, missing == 1 ? "chunk" : "chunks");
+        fflush(stderr);
     }
 }
 
 static int receive_payload_and_publish(fct_channel_t* control, int* listener,
                                        const fct_file_meta_t* meta, uint16_t worker_count,
                                        receive_session_t* session, int output_fd,
-                                       bool* discard_session) {
+                                       bool* discard_session, bool discarded_corrupt) {
     uint32_t missing = fct_bitmap_missing(&session->completed);
     if (worker_count > missing)
         worker_count = (uint16_t)missing;
-    fct_control_frame_t ready = {.magic = FCT_MAGIC, .type = FCT_CONTROL_READY, .arg = worker_count};
+    fct_control_frame_t ready = {
+        .magic = FCT_MAGIC, .type = FCT_CONTROL_READY, .arg = worker_count};
     if (generate_token(ready.token) < 0) {
         int saved = errno;
         (void)send_result_frame(control, FCT_RESULT_TRANSFER_ERROR, NULL);
@@ -717,6 +797,23 @@ static int receive_payload_and_publish(fct_channel_t* control, int* listener,
     }
     if (send_bitmap_frame(control, &ready, &session->completed) < 0)
         return -1;
+
+    char size_buf[32];
+    format_bytes(meta->file_size, size_buf, sizeof(size_buf));
+    fprintf(stderr, "Receiving '%s' (%s, %u %s, %u %s)\n", meta->filename, size_buf,
+            meta->total_chunks, meta->total_chunks == 1 ? "chunk" : "chunks", worker_count,
+            worker_count == 1 ? "worker" : "workers");
+    if (discarded_corrupt)
+        fprintf(stderr, "Checkpoint invalid; starting fresh transfer\n");
+    uint32_t resumed_chunks = fct_bitmap_completed(&session->completed);
+    if (resumed_chunks > 0) {
+        uint64_t already_bytes = resumed_bytes(meta, &session->completed);
+        double pct =
+            meta->file_size > 0 ? 100.0 * (double)already_bytes / (double)meta->file_size : 100.0;
+        fprintf(stderr, "Resuming: %u/%u chunks (%.2f%%)\n", resumed_chunks, meta->total_chunks,
+                pct);
+    }
+    fflush(stderr);
 
     fct_channel_t data_channels[FCT_MAX_DATA_WORKERS];
     init_channels(data_channels, FCT_MAX_DATA_WORKERS);
@@ -731,9 +828,22 @@ static int receive_payload_and_publish(fct_channel_t* control, int* listener,
         errno = accept_errno;
     }
 
+    recv_stats_t stats = {0};
     if (rc == 0) {
-        fct_channel_t* channels = worker_count < 2 ? control : data_channels;
-        rc = receive_rounds(control, channels, worker_count, ready, meta, session, output_fd, &code);
+        int mu_err = pthread_mutex_init(&stats.mu, NULL);
+        if (mu_err != 0) {
+            rc = -1;
+            code = FCT_RESULT_TRANSFER_ERROR;
+            errno = mu_err;
+        } else {
+            fct_progress_t cb = {.on_chunk_stat = recv_stats_on_chunk, .context = &stats};
+            fct_channel_t* channels = worker_count < 2 ? control : data_channels;
+            rc = receive_rounds(control, channels, worker_count, ready, meta, session, output_fd,
+                                &cb, &code);
+            int round_errno = errno;
+            pthread_mutex_destroy(&stats.mu);
+            errno = round_errno;
+        }
     }
 
     int saved = errno;
@@ -752,6 +862,26 @@ static int receive_payload_and_publish(fct_channel_t* control, int* listener,
                        linkat(session->dir_fd, PART_NAME, output_fd, meta->filename, 0) == 0) {
                 *discard_session = true;
                 if (fsync(output_fd) == 0) {
+                    if (stats.chunks == 0 && meta->total_chunks == 0) {
+                        fprintf(stderr, "Compression: OFF (empty)\n");
+                    } else if (stats.chunks == 0) {
+                        fprintf(stderr, "Compression: N/A (0 chunks received)\n");
+                    } else if (stats.compressed_chunks > 0) {
+                        double saved_pct = stats.raw_bytes > 0
+                                               ? 100.0 * (1.0 - (double)stats.payload_bytes /
+                                                                    (double)stats.raw_bytes)
+                                               : 0.0;
+                        fprintf(stderr, "Compression: ON (%llu/%llu %s, Saved: %.1f%%)\n",
+                                (unsigned long long)stats.compressed_chunks,
+                                (unsigned long long)stats.chunks,
+                                stats.chunks == 1 ? "chunk" : "chunks", saved_pct);
+                    } else {
+                        fprintf(stderr, "Compression: OFF (0/%llu %s)\n",
+                                (unsigned long long)stats.chunks,
+                                stats.chunks == 1 ? "chunk" : "chunks");
+                    }
+                    fprintf(stderr, "Received '%s' (SHA-256 verified)\n", meta->filename);
+                    fflush(stderr);
                     code = FCT_RESULT_OK;
                     rc = 0;
                 }
@@ -773,14 +903,15 @@ static int receive_file(fct_channel_t* control, int* listener, int output_fd) {
 
     receive_session_t session = {.dir_fd = -1, .writer = {.fd = -1}};
     bool discard_session = false;
+    bool discarded_corrupt = false;
     struct stat destination;
     int result = -1;
     if (fstatat(output_fd, meta.filename, &destination, AT_SYMLINK_NOFOLLOW) == 0) {
         errno = EEXIST;
-    } else if (errno == ENOENT &&
-               open_receive_session(&session, &meta, output_fd, &discard_session) == 0) {
+    } else if (errno == ENOENT && open_receive_session(&session, &meta, output_fd, &discard_session,
+                                                       &discarded_corrupt) == 0) {
         result = receive_payload_and_publish(control, listener, &meta, worker_count, &session,
-                                             output_fd, &discard_session);
+                                             output_fd, &discard_session, discarded_corrupt);
         discard_session |= fct_bitmap_completed(&session.completed) == 0;
         goto done;
     }
@@ -791,6 +922,14 @@ static int receive_file(fct_channel_t* control, int* listener, int output_fd) {
 
 done:;
     int saved = errno;
+    if (result != 0 && !discard_session && session.dir_fd >= 0) {
+        uint32_t saved_chunks = fct_bitmap_completed(&session.completed);
+        if (saved_chunks > 0) {
+            fprintf(stderr, "Checkpoint saved: %u/%u chunks (rerun to resume)\n", saved_chunks,
+                    meta.total_chunks);
+            fflush(stderr);
+        }
+    }
     fw_close(&session.writer);
     fct_bitmap_free(&session.completed);
     if (discard_session && session.dir_fd >= 0) {
@@ -817,7 +956,7 @@ static int run_server(const fct_options_t* options) {
         errno = saved;
         return -1;
     }
-    fprintf(stderr, "Listening on port %d\n", options->port);
+    fprintf(stderr, "Listening on port %d (dir: %s)\n", options->port, options->output_dir);
     fflush(stderr);
 
     fct_channel_t channel = {.sockfd = -1};
@@ -837,6 +976,7 @@ static int run_server(const fct_options_t* options) {
 }
 
 int main(int argc, char** argv) {
+    signal(SIGPIPE, SIG_IGN);
     fct_options_t options;
     int result = fct_parse_options(argc, argv, &options, stderr);
 

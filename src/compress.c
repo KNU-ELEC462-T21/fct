@@ -93,8 +93,9 @@ size_t fct_compress_bound(size_t raw_len) {
     return (size_t)compressBound((uLong)raw_len);
 }
 
-int fct_compression_mode(const char* filename, const void* first_chunk, size_t len, bool force,
-                         void* scratch, size_t capacity, fct_compression_mode_t* mode) {
+int fct_compression_mode_ex(const char* filename, const void* first_chunk, size_t len, bool force,
+                            void* scratch, size_t capacity, fct_compression_mode_t* mode,
+                            fct_compression_reason_t* reason) {
     size_t compressed_len;
 
     if (!mode || (len > 0 && !first_chunk) || len > DEFAULT_CHUNK_SZ) {
@@ -104,20 +105,59 @@ int fct_compression_mode(const char* filename, const void* first_chunk, size_t l
 
     if (force) {
         *mode = FCT_COMPRESS_FORCE;
+        if (reason)
+            *reason = FCT_COMPRESS_REASON_FORCE;
         return 0;
     }
-    if (len == 0 || has_compressed_extension(filename) ||
-        has_compressed_signature(first_chunk, len)) {
+    if (len == 0) {
         *mode = FCT_COMPRESS_RAW;
+        if (reason)
+            *reason = FCT_COMPRESS_REASON_EMPTY;
+        return 0;
+    }
+    if (has_compressed_extension(filename) || has_compressed_signature(first_chunk, len)) {
+        *mode = FCT_COMPRESS_RAW;
+        if (reason)
+            *reason = FCT_COMPRESS_REASON_COMPRESSED_FORMAT;
         return 0;
     }
 
     /* Trial-compress the first chunk to estimate how compressible the file is. */
     if (deflate_into(first_chunk, len, scratch, capacity, &compressed_len) < 0)
         return -1;
-    *mode =
-        compressed_len * 100 <= len * FCT_AUTO_RATIO_PERCENT ? FCT_COMPRESS_AUTO : FCT_COMPRESS_RAW;
+    if (compressed_len * 100 <= len * FCT_AUTO_RATIO_PERCENT) {
+        *mode = FCT_COMPRESS_AUTO;
+        if (reason)
+            *reason = FCT_COMPRESS_REASON_AUTO;
+    } else {
+        *mode = FCT_COMPRESS_RAW;
+        if (reason)
+            *reason = FCT_COMPRESS_REASON_LOW_RATIO;
+    }
     return 0;
+}
+
+int fct_compression_mode(const char* filename, const void* first_chunk, size_t len, bool force,
+                         void* scratch, size_t capacity, fct_compression_mode_t* mode) {
+    return fct_compression_mode_ex(filename, first_chunk, len, force, scratch, capacity, mode,
+                                   NULL);
+}
+
+const char* fct_compression_reason_str(fct_compression_reason_t reason) {
+    switch (reason) {
+    case FCT_COMPRESS_REASON_AUTO:
+        return "ON (auto)";
+    case FCT_COMPRESS_REASON_FORCE:
+        return "ON (force)";
+    case FCT_COMPRESS_REASON_EMPTY:
+        return "OFF (empty)";
+    case FCT_COMPRESS_REASON_COMPRESSED_FORMAT:
+        return "OFF (compressed format)";
+    case FCT_COMPRESS_REASON_LOW_RATIO:
+        return "OFF (low ratio)";
+    default:
+        return "unknown";
+    }
 }
 
 int fct_encode_chunk(fct_compression_mode_t mode, const void* src, size_t raw_len, void* scratch,
