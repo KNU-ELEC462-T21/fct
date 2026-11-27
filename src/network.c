@@ -14,9 +14,13 @@
 #include <time.h>
 #include <unistd.h>
 
-#define META_SIZE 276u
-#define CHUNK_SIZE 24u
+#define META_SIZE 308u
+#define CHUNK_SIZE 28u
 #define CONTROL_SIZE FCT_CONTROL_FRAME_WIRE_SIZE
+#define BITMAP_HEADER_SIZE FCT_BITMAP_HEADER_WIRE_SIZE
+
+_Static_assert(sizeof(fct_file_meta_t) == META_SIZE, "fct_file_meta_t must be 308 bytes");
+_Static_assert(sizeof(fct_chunk_header_t) == CHUNK_SIZE, "fct_chunk_header_t must be 28 bytes");
 
 static void put16(unsigned char* p, uint16_t v) {
     p[0] = (unsigned char)(v >> 8);
@@ -48,15 +52,20 @@ static uint64_t get64(const unsigned char* p) {
 }
 
 static bool is_valid_control_type(uint16_t type) {
-    return type >= FCT_CONTROL_HELLO && type <= FCT_CONTROL_RESULT;
+    return type >= FCT_CONTROL_HELLO && type <= FCT_CONTROL_RETRY;
 }
 
-static bool is_valid_chunk_flags(uint32_t flags, uint32_t payload_len) {
-    if ((flags & ~FCT_CHUNK_FLAG_COMPRESSED) != 0)
+static bool is_valid_chunk_header(const fct_chunk_header_t* hdr) {
+    if (!hdr || hdr->magic != FCT_MAGIC)
         return false;
-    if ((flags & FCT_CHUNK_FLAG_COMPRESSED) != 0 && payload_len == 0)
-        return false;
-    return true;
+    if (hdr->flags == 0)
+        return true;
+    if (hdr->flags == FCT_CHUNK_FLAG_COMPRESSED)
+        return hdr->payload_len > 0;
+    if (hdr->flags == FCT_CHUNK_FLAG_EOR) {
+        return hdr->chunk_id == 0 && hdr->offset == 0 && hdr->payload_len == 0 && hdr->crc32 == 0;
+    }
+    return false;
 }
 
 static void encode_control(unsigned char wire[CONTROL_SIZE], const fct_control_frame_t* frame) {
@@ -79,6 +88,7 @@ static void encode_meta(unsigned char wire[META_SIZE], const fct_file_meta_t* me
     put32(wire + 12, meta->chunk_size);
     put32(wire + 16, meta->total_chunks);
     memcpy(wire + 20, meta->filename, sizeof(meta->filename));
+    memcpy(wire + 20 + sizeof(meta->filename), meta->file_sha256, sizeof(meta->file_sha256));
 }
 
 static void decode_meta(const unsigned char wire[META_SIZE], fct_file_meta_t* meta) {
@@ -87,6 +97,7 @@ static void decode_meta(const unsigned char wire[META_SIZE], fct_file_meta_t* me
     meta->chunk_size = get32(wire + 12);
     meta->total_chunks = get32(wire + 16);
     memcpy(meta->filename, wire + 20, sizeof(meta->filename));
+    memcpy(meta->file_sha256, wire + 20 + sizeof(meta->filename), sizeof(meta->file_sha256));
 }
 
 static void encode_chunk_header(unsigned char wire[CHUNK_SIZE], const fct_chunk_header_t* hdr) {
@@ -95,6 +106,7 @@ static void encode_chunk_header(unsigned char wire[CHUNK_SIZE], const fct_chunk_
     put64(wire + 8, hdr->offset);
     put32(wire + 16, hdr->payload_len);
     put32(wire + 20, hdr->flags);
+    put32(wire + 24, hdr->crc32);
 }
 
 static void decode_chunk_header(const unsigned char wire[CHUNK_SIZE], fct_chunk_header_t* hdr) {
@@ -103,6 +115,7 @@ static void decode_chunk_header(const unsigned char wire[CHUNK_SIZE], fct_chunk_
     hdr->offset = get64(wire + 8);
     hdr->payload_len = get32(wire + 16);
     hdr->flags = get32(wire + 20);
+    hdr->crc32 = get32(wire + 24);
 }
 
 static bool is_valid_deadline(const struct timespec* deadline) {
@@ -484,8 +497,8 @@ int fct_channel_recv_meta(fct_channel_t* ch, fct_file_meta_t* out_meta) {
 
 int fct_channel_send_chunk(fct_channel_t* ch, const fct_chunk_header_t* hdr, const void* payload) {
     unsigned char wire[CHUNK_SIZE];
-    if (!ch || !hdr || ch->sockfd < 0 || hdr->magic != FCT_MAGIC ||
-        !is_valid_chunk_flags(hdr->flags, hdr->payload_len) || (hdr->payload_len && !payload)) {
+    if (!ch || !hdr || ch->sockfd < 0 || !is_valid_chunk_header(hdr) ||
+        (hdr->payload_len && !payload)) {
         errno = EINVAL;
         return -1;
     }
@@ -508,7 +521,7 @@ int fct_channel_recv_chunk(fct_channel_t* ch, fct_chunk_header_t* out_hdr, void*
     if (recv_exact(ch->sockfd, wire, sizeof(wire)) < 0)
         return -1;
     decode_chunk_header(wire, &hdr);
-    if (hdr.magic != FCT_MAGIC || !is_valid_chunk_flags(hdr.flags, hdr.payload_len)) {
+    if (!is_valid_chunk_header(&hdr)) {
         errno = EPROTO;
         return -1;
     }
@@ -715,12 +728,52 @@ int fct_channel_recv_meta_until(fct_channel_t* ch, fct_file_meta_t* meta,
     return 0;
 }
 
+int fct_channel_send_bitmap_until(fct_channel_t* ch, const uint8_t* bits, size_t byte_len,
+                                  const struct timespec* deadline) {
+    unsigned char hdr[BITMAP_HEADER_SIZE];
+    if (!ch || ch->sockfd < 0 || !is_valid_deadline(deadline) || byte_len > FCT_MAX_BITMAP_BYTES ||
+        (byte_len > 0 && !bits)) {
+        errno = EINVAL;
+        return -1;
+    }
+    put32(hdr, FCT_MAGIC);
+    put32(hdr + 4, (uint32_t)byte_len);
+    if (send_exact_until(ch->sockfd, hdr, sizeof(hdr), deadline) < 0)
+        return -1;
+    if (byte_len > 0 && send_exact_until(ch->sockfd, bits, byte_len, deadline) < 0)
+        return -1;
+    ch->bytes_sent += sizeof(hdr) + (uint64_t)byte_len;
+    return 0;
+}
+
+int fct_channel_recv_bitmap_until(fct_channel_t* ch, uint8_t* bits, size_t expected_byte_len,
+                                  const struct timespec* deadline) {
+    unsigned char hdr[BITMAP_HEADER_SIZE];
+    if (!ch || ch->sockfd < 0 || !is_valid_deadline(deadline) ||
+        expected_byte_len > FCT_MAX_BITMAP_BYTES || (expected_byte_len > 0 && !bits)) {
+        errno = EINVAL;
+        return -1;
+    }
+    if (recv_exact_until(ch->sockfd, hdr, sizeof(hdr), deadline) < 0)
+        return -1;
+    uint32_t magic = get32(hdr);
+    uint32_t wire_len = get32(hdr + 4);
+    if (magic != FCT_MAGIC || wire_len > FCT_MAX_BITMAP_BYTES || wire_len != expected_byte_len) {
+        errno = EPROTO;
+        return -1;
+    }
+    if (wire_len > 0 && recv_exact_until(ch->sockfd, bits, wire_len, deadline) < 0)
+        return -1;
+    ch->bytes_recv += sizeof(hdr) + (uint64_t)wire_len;
+    return 0;
+}
+
 int fct_channel_send_chunk_idle(fct_channel_t* ch, const fct_chunk_header_t* hdr,
                                 const void* payload, unsigned idle_timeout_ms) {
     unsigned char wire[CHUNK_SIZE];
     struct timespec now, deadline;
-    if (!ch || !hdr || ch->sockfd < 0 || hdr->magic != FCT_MAGIC ||
-        !is_valid_chunk_flags(hdr->flags, hdr->payload_len) || (hdr->payload_len && !payload)) {
+    if (!ch || !hdr || ch->sockfd < 0 || !is_valid_chunk_header(hdr) ||
+        (hdr->payload_len && !payload)) {
         errno = EINVAL;
         return -1;
     }
@@ -754,7 +807,7 @@ int fct_channel_recv_chunk_idle(fct_channel_t* ch, fct_chunk_header_t* hdr, void
     if (rc != 0)
         return rc;
     decode_chunk_header(wire, &parsed);
-    if (parsed.magic != FCT_MAGIC || !is_valid_chunk_flags(parsed.flags, parsed.payload_len)) {
+    if (!is_valid_chunk_header(&parsed)) {
         errno = EPROTO;
         return -1;
     }

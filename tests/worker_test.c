@@ -1,5 +1,7 @@
 #define _POSIX_C_SOURCE 200809L
 
+#include "bitmap.h"
+#include "checksum.h"
 #include "compress_stub.h"
 #include "file_reader.h"
 #include "file_writer.h"
@@ -163,6 +165,8 @@ typedef struct {
     file_reader_t* reader;
     const fct_file_meta_t* meta;
     fct_compression_mode_t mode;
+    const fct_bitmap_t* completed;
+    bool is_retry;
     const fct_progress_t* progress;
     int rc;
     int err;
@@ -171,8 +175,8 @@ typedef struct {
 static void* send_thread_entry(void* arg) {
     send_thread_args_t* a = arg;
     errno = 0;
-    a->rc = fct_send_parallel(a->channels, a->channel_count, a->reader, a->meta, a->mode, NULL,
-                              false, a->progress);
+    a->rc = fct_send_parallel(a->channels, a->channel_count, a->reader, a->meta, a->mode,
+                              a->completed, a->is_retry, a->progress);
     a->err = errno;
     return NULL;
 }
@@ -376,11 +380,14 @@ static void test_out_of_order_assembly(const char* dir) {
             .offset = (uint64_t)id * chunk_size,
             .payload_len = (uint32_t)payload_len,
             .flags = flags,
+            .crc32 = fct_crc32(raw, (size_t)raw_len),
         };
         assert(fct_channel_send_chunk_idle(&clients[i % 4], &hdr, payload, 2000) == 0);
     }
-    for (size_t i = 0; i < 4; ++i)
-        assert(shutdown(clients[i].sockfd, SHUT_WR) == 0);
+    for (size_t i = 0; i < 4; ++i) {
+        fct_chunk_header_t eor = {.magic = FCT_MAGIC, .flags = FCT_CHUNK_FLAG_EOR};
+        assert(fct_channel_send_chunk_idle(&clients[i], &eor, NULL, 2000) == 0);
+    }
 
     fct_result_t result = FCT_RESULT_TRANSFER_ERROR;
     assert(fct_receive_parallel(servers, 4, &writer, &meta, NULL, NULL, NULL, &result) == 0);
@@ -395,6 +402,14 @@ static void test_out_of_order_assembly(const char* dir) {
     unlink(dst_path);
 }
 
+static void send_eor_manual(fct_channel_t* ch) {
+    fct_chunk_header_t eor = {
+        .magic = FCT_MAGIC,
+        .flags = FCT_CHUNK_FLAG_EOR,
+    };
+    assert(fct_channel_send_chunk_idle(ch, &eor, NULL, 2000) == 0);
+}
+
 static void send_raw_chunk_manual(fct_channel_t* ch, uint32_t id, uint64_t offset, uint32_t len,
                                   uint8_t fill) {
     unsigned char* buf = malloc(len > 0 ? len : 1);
@@ -406,6 +421,7 @@ static void send_raw_chunk_manual(fct_channel_t* ch, uint32_t id, uint64_t offse
         .offset = offset,
         .payload_len = len,
         .flags = 0,
+        .crc32 = fct_crc32(buf, len),
     };
     assert(fct_channel_send_chunk_idle(ch, &hdr, len > 0 ? buf : NULL, 2000) == 0);
     free(buf);
@@ -430,8 +446,8 @@ static void test_duplicate_and_missing_chunks(const char* dir) {
     send_raw_chunk_manual(&clients[1], 1, chunk_size, chunk_size, 'B');
     send_raw_chunk_manual(&clients[1], 2, 2U * chunk_size, chunk_size, 'C');
     send_raw_chunk_manual(&clients[1], 3, 3U * chunk_size, chunk_size, 'D');
-    shutdown(clients[0].sockfd, SHUT_WR);
-    shutdown(clients[1].sockfd, SHUT_WR);
+    send_eor_manual(&clients[0]);
+    send_eor_manual(&clients[1]);
 
     fct_result_t result = FCT_RESULT_OK;
     errno = 0;
@@ -444,19 +460,22 @@ static void test_duplicate_and_missing_chunks(const char* dir) {
     fw_close(&writer);
     unlink(dst_path);
 
-    /* 2. Missing chunk_id despite clean EOF on all channels. */
+    /* 2. Missing chunk_id despite EOR on all channels and zero CRC errors. */
     assert(fw_init(&writer, dst_path, file_size, chunk_size) == 0);
     make_tcp_pairs(2, clients, servers);
 
     send_raw_chunk_manual(&clients[0], 0, 0, chunk_size, 'A');
     send_raw_chunk_manual(&clients[0], 1, chunk_size, chunk_size, 'B');
     send_raw_chunk_manual(&clients[1], 3, 3U * chunk_size, chunk_size, 'D');
-    shutdown(clients[0].sockfd, SHUT_WR);
-    shutdown(clients[1].sockfd, SHUT_WR);
+    send_eor_manual(&clients[0]);
+    send_eor_manual(&clients[1]);
 
+    uint32_t crc_errors = 99;
     result = FCT_RESULT_OK;
     errno = 0;
-    assert(fct_receive_parallel(servers, 2, &writer, &meta, NULL, NULL, NULL, &result) == -1);
+    assert(fct_receive_parallel(servers, 2, &writer, &meta, NULL, NULL, &crc_errors, &result) ==
+           -1);
+    assert(crc_errors == 0);
     assert(result == FCT_RESULT_PROTOCOL_ERROR);
     assert(errno == EPROTO);
 
@@ -481,7 +500,7 @@ static void test_protocol_errors_and_decode_failures(const char* dir) {
     assert(fw_init(&writer, dst_path, file_size, chunk_size) == 0);
     make_tcp_pairs(1, &client, &server);
     send_raw_chunk_manual(&client, 3, 3U * chunk_size, 100U, 'X');
-    shutdown(client.sockfd, SHUT_WR);
+    send_eor_manual(&client);
     errno = 0;
     assert(fct_receive_parallel(&server, 1, &writer, &meta, NULL, NULL, NULL, &result) == -1);
     assert(result == FCT_RESULT_PROTOCOL_ERROR && errno == EPROTO);
@@ -494,7 +513,7 @@ static void test_protocol_errors_and_decode_failures(const char* dir) {
     assert(fw_init(&writer, dst_path, file_size, chunk_size) == 0);
     make_tcp_pairs(1, &client, &server);
     send_raw_chunk_manual(&client, 1, 0, chunk_size, 'X');
-    shutdown(client.sockfd, SHUT_WR);
+    send_eor_manual(&client);
     errno = 0;
     assert(fct_receive_parallel(&server, 1, &writer, &meta, NULL, NULL, NULL, &result) == -1);
     assert(result == FCT_RESULT_PROTOCOL_ERROR && errno == EPROTO);
@@ -507,7 +526,7 @@ static void test_protocol_errors_and_decode_failures(const char* dir) {
     assert(fw_init(&writer, dst_path, file_size, chunk_size) == 0);
     make_tcp_pairs(1, &client, &server);
     send_raw_chunk_manual(&client, 2, 2U * chunk_size, 200U, 'X');
-    shutdown(client.sockfd, SHUT_WR);
+    send_eor_manual(&client);
     errno = 0;
     assert(fct_receive_parallel(&server, 1, &writer, &meta, NULL, NULL, NULL, &result) == -1);
     assert(result == FCT_RESULT_PROTOCOL_ERROR && errno == EPROTO);
@@ -531,7 +550,7 @@ static void test_protocol_errors_and_decode_failures(const char* dir) {
     };
     assert(fct_channel_send_chunk_idle(&client, &hdr, bad_buf, 2000) == 0);
     free(bad_buf);
-    shutdown(client.sockfd, SHUT_WR);
+    send_eor_manual(&client);
     errno = 0;
     assert(fct_receive_parallel(&server, 1, &writer, &meta, NULL, NULL, NULL, &result) == -1);
     assert(result == FCT_RESULT_PROTOCOL_ERROR && errno == EPROTO);
@@ -552,7 +571,7 @@ static void test_protocol_errors_and_decode_failures(const char* dir) {
         .flags = FCT_CHUNK_FLAG_COMPRESSED,
     };
     assert(fct_channel_send_chunk_idle(&client, &hdr, corrupt, 2000) == 0);
-    shutdown(client.sockfd, SHUT_WR);
+    send_eor_manual(&client);
     errno = 0;
     assert(fct_receive_parallel(&server, 1, &writer, &meta, NULL, NULL, NULL, &result) == -1);
     assert(result == FCT_RESULT_PROTOCOL_ERROR && errno == EBADMSG);
@@ -579,9 +598,10 @@ static void test_protocol_errors_and_decode_failures(const char* dir) {
         .offset = 2U * chunk_size,
         .payload_len = (uint32_t)enc_len,
         .flags = enc_flags,
+        .crc32 = fct_crc32(raw_small, sizeof(raw_small)),
     };
     assert(fct_channel_send_chunk_idle(&client, &hdr, enc_payload, 2000) == 0);
-    shutdown(client.sockfd, SHUT_WR);
+    send_eor_manual(&client);
     compress_stub_set_decode_errno(ENOMEM);
     errno = 0;
     assert(fct_receive_parallel(&server, 1, &writer, &meta, NULL, NULL, NULL, &result) == -1);
@@ -595,9 +615,9 @@ static void test_protocol_errors_and_decode_failures(const char* dir) {
     /* Case 7: truncated chunk frame mid-payload -> PROTOCOL_ERROR / EPROTO */
     assert(fw_init(&writer, dst_path, file_size, chunk_size) == 0);
     make_tcp_pairs(1, &client, &server);
-    unsigned char partial_wire[24 + 5] = {
-        0x46, 0x43, 0x54, 0x31, 0,   0, 0, 2, 0, 0,   0,   0,   0,   0,   0x08,
-        0x00, 0,    0,    0,    100, 0, 0, 0, 0, 'a', 'b', 'c', 'd', 'e',
+    unsigned char partial_wire[28 + 5] = {
+        0x46, 0x43, 0x54, 0x31, 0, 0, 0, 2, 0, 0, 0, 0,   0,   0,   0x08, 0x00, 0,
+        0,    0,    100,  0,    0, 0, 0, 0, 0, 0, 0, 'a', 'b', 'c', 'd',  'e',
     };
     assert(send_exact(client.sockfd, partial_wire, sizeof(partial_wire)) == 0);
     shutdown(client.sockfd, SHUT_WR);
@@ -628,7 +648,7 @@ static void test_storage_error(const char* dir) {
     fct_channel_t client, server;
     make_tcp_pairs(1, &client, &server);
     send_raw_chunk_manual(&client, 0, 0, 1024U, 'S');
-    shutdown(client.sockfd, SHUT_WR);
+    send_eor_manual(&client);
 
     fct_result_t result = FCT_RESULT_OK;
     errno = 0;
@@ -721,7 +741,7 @@ static void* client_fail_result_exchange_thread(void* arg) {
     fct_channel_t* client = arg;
     /* Send chunk 0 with invalid offset so server fails with FCT_RESULT_PROTOCOL_ERROR. */
     send_raw_chunk_manual(client, 0, 1234ULL, 1024U, 'F');
-    shutdown(client->sockfd, SHUT_WR);
+    send_eor_manual(client);
 
     struct timespec dl = deadline_after_ms(3000);
     fct_control_frame_t frame = {0};
@@ -774,6 +794,545 @@ static void test_single_channel_failure_result_exchange(const char* dir) {
     unlink(dst_path);
 }
 
+static void prefill_writer_sentinel(file_writer_t* writer, uint8_t fill) {
+    unsigned char* buf = malloc(writer->chunk_size > 0 ? writer->chunk_size : 1);
+    assert(buf != NULL);
+    memset(buf, fill, writer->chunk_size);
+    for (uint32_t id = 0; id < writer->total_chunks; ++id) {
+        uint64_t off = (uint64_t)id * writer->chunk_size;
+        uint64_t rem = writer->file_size - off;
+        size_t len = rem < writer->chunk_size ? (size_t)rem : writer->chunk_size;
+        assert(fw_write_chunk(writer, id, buf, len) == (ssize_t)len);
+    }
+    free(buf);
+}
+
+static void assert_writer_chunk_byte(const file_writer_t* writer, uint32_t chunk_id,
+                                     uint8_t expected) {
+    uint64_t off = (uint64_t)chunk_id * writer->chunk_size;
+    uint64_t rem = writer->file_size - off;
+    size_t len = rem < writer->chunk_size ? (size_t)rem : writer->chunk_size;
+    unsigned char* buf = malloc(len);
+    assert(buf != NULL);
+    ssize_t n = pread(writer->fd, buf, len, (off_t)off);
+    assert(n == (ssize_t)len);
+    for (size_t i = 0; i < len; ++i)
+        assert(buf[i] == expected);
+    free(buf);
+}
+
+static void test_early_eof_before_eor(const char* dir) {
+    char dst_path[256];
+    snprintf(dst_path, sizeof(dst_path), "%s/early_eof.bin", dir);
+
+    const uint32_t chunk_size = 1024U;
+    const uint64_t file_size = 2U * chunk_size;
+    fct_file_meta_t meta = make_meta(file_size, chunk_size, "early_eof.bin");
+
+    /* 1. Immediate EOF without EOR on N = 1 -> TRANSFER_ERROR / ECONNRESET. */
+    file_writer_t writer;
+    assert(fw_init(&writer, dst_path, file_size, chunk_size) == 0);
+    fct_channel_t client, server;
+    make_tcp_pairs(1, &client, &server);
+    shutdown(client.sockfd, SHUT_WR);
+
+    fct_result_t result = FCT_RESULT_OK;
+    errno = 0;
+    assert(fct_receive_parallel(&server, 1, &writer, &meta, NULL, NULL, NULL, &result) == -1);
+    assert(result == FCT_RESULT_TRANSFER_ERROR && errno == ECONNRESET);
+
+    close_channels(1, &client);
+    close_channels(1, &server);
+    fw_close(&writer);
+    unlink(dst_path);
+
+    /* 2. All chunks sent cleanly, then EOF without EOR on N = 1 -> still TRANSFER_ERROR. */
+    assert(fw_init(&writer, dst_path, file_size, chunk_size) == 0);
+    fct_bitmap_t bm;
+    assert(fct_bitmap_init(&bm, meta.total_chunks) == 0);
+    make_tcp_pairs(1, &client, &server);
+    send_raw_chunk_manual(&client, 0, 0, chunk_size, 'A');
+    send_raw_chunk_manual(&client, 1, chunk_size, chunk_size, 'B');
+    shutdown(client.sockfd, SHUT_WR);
+
+    result = FCT_RESULT_OK;
+    errno = 0;
+    assert(fct_receive_parallel(&server, 1, &writer, &meta, &bm, NULL, NULL, &result) == -1);
+    assert(result == FCT_RESULT_TRANSFER_ERROR && errno == ECONNRESET);
+    assert(fct_bitmap_completed(&bm) == 2);
+
+    fct_bitmap_free(&bm);
+    close_channels(1, &client);
+    close_channels(1, &server);
+    fw_close(&writer);
+    unlink(dst_path);
+
+    /* 3. N = 2: one channel sends EOR, the other drops at EOF -> TRANSFER_ERROR, partial preserved.
+     */
+    assert(fw_init(&writer, dst_path, file_size, chunk_size) == 0);
+    assert(fct_bitmap_init(&bm, meta.total_chunks) == 0);
+    fct_channel_t clients[2], servers[2];
+    make_tcp_pairs(2, clients, servers);
+    send_raw_chunk_manual(&clients[0], 0, 0, chunk_size, 'A');
+    send_eor_manual(&clients[0]);
+    send_raw_chunk_manual(&clients[1], 1, chunk_size, chunk_size, 'B');
+    shutdown(clients[1].sockfd, SHUT_WR);
+
+    result = FCT_RESULT_OK;
+    errno = 0;
+    assert(fct_receive_parallel(servers, 2, &writer, &meta, &bm, NULL, NULL, &result) == -1);
+    assert(result == FCT_RESULT_TRANSFER_ERROR && errno == ECONNRESET);
+    assert(fct_bitmap_get(&bm, 1));
+
+    fct_bitmap_free(&bm);
+    close_channels(2, clients);
+    close_channels(2, servers);
+    fw_close(&writer);
+    unlink(dst_path);
+}
+
+static void test_selective_bitmap_send_and_receive(const char* dir) {
+    char src_path[256], dst_path[256];
+    snprintf(src_path, sizeof(src_path), "%s/sel_src.bin", dir);
+    snprintf(dst_path, sizeof(dst_path), "%s/sel_dst.bin", dir);
+
+    const uint32_t chunk_size = 4096U;
+    const uint64_t file_size = 9U * chunk_size + 333U; /* 10 chunks */
+    write_mixed_pattern_file(src_path, file_size, chunk_size);
+    fct_file_meta_t meta = make_meta(file_size, chunk_size, "sel.bin");
+
+    file_reader_t reader;
+    file_writer_t writer;
+    assert(fr_init(&reader, src_path, chunk_size) == 0);
+    assert(fw_init(&writer, dst_path, file_size, chunk_size) == 0);
+
+    fct_bitmap_t send_bm, recv_bm;
+    assert(fct_bitmap_init(&send_bm, meta.total_chunks) == 0);
+    assert(fct_bitmap_init(&recv_bm, meta.total_chunks) == 0);
+
+    /* Pre-populate chunks {0, 2, 5, 7, 9} into dst_path and bitmaps. */
+    const uint32_t preset[5] = {0, 2, 5, 7, 9};
+    unsigned char* chunk_buf = malloc(chunk_size);
+    assert(chunk_buf != NULL);
+    for (size_t i = 0; i < 5; ++i) {
+        uint32_t id = preset[i];
+        ssize_t rlen = fr_read_chunk(&reader, id, chunk_buf);
+        assert(rlen > 0);
+        assert(fw_write_chunk(&writer, id, chunk_buf, (size_t)rlen) == rlen);
+        assert(fct_bitmap_set(&send_bm, id) == 0);
+        assert(fct_bitmap_set(&recv_bm, id) == 0);
+    }
+    free(chunk_buf);
+
+    uint64_t expected_missing_raw = 0;
+    for (uint32_t id = 0; id < meta.total_chunks; ++id) {
+        if (!fct_bitmap_get(&send_bm, id)) {
+            uint64_t off = (uint64_t)id * chunk_size;
+            uint64_t rem = file_size - off;
+            expected_missing_raw += rem < chunk_size ? rem : chunk_size;
+        }
+    }
+
+    fct_channel_t clients[3], servers[3];
+    make_tcp_pairs(3, clients, servers);
+
+    test_progress_t send_prog_ctx, recv_prog_ctx;
+    progress_init(&send_prog_ctx);
+    progress_init(&recv_prog_ctx);
+    fct_progress_t send_prog = {.on_chunk = progress_cb, .context = &send_prog_ctx};
+    fct_progress_t recv_prog = {.on_chunk = progress_cb, .context = &recv_prog_ctx};
+
+    send_thread_args_t sargs = {
+        .channels = clients,
+        .channel_count = 3,
+        .reader = &reader,
+        .meta = &meta,
+        .mode = FCT_COMPRESS_AUTO,
+        .completed = &send_bm,
+        .is_retry = false,
+        .progress = &send_prog,
+    };
+    pthread_t sthread;
+    assert(pthread_create(&sthread, NULL, send_thread_entry, &sargs) == 0);
+
+    uint32_t crc_errors = 99;
+    fct_result_t result = FCT_RESULT_TRANSFER_ERROR;
+    int rrc = fct_receive_parallel(servers, 3, &writer, &meta, &recv_bm, &recv_prog, &crc_errors,
+                                   &result);
+    assert(pthread_join(sthread, NULL) == 0);
+
+    assert(sargs.rc == 0);
+    assert(rrc == 0);
+    assert(result == FCT_RESULT_OK);
+    assert(crc_errors == 0);
+    assert(fct_bitmap_is_complete(&recv_bm));
+    assert(send_prog_ctx.calls == 5 && recv_prog_ctx.calls == 5);
+    assert(send_prog_ctx.total_raw == expected_missing_raw);
+    assert(recv_prog_ctx.total_raw == expected_missing_raw);
+    assert(send_prog_ctx.total_payload == recv_prog_ctx.total_payload);
+
+    assert_files_equal(src_path, dst_path, file_size);
+
+    /* Already-complete bitmap short-circuits with channel_count == 0 and rejects > 0. */
+    assert(fct_send_parallel(NULL, 0, &reader, &meta, FCT_COMPRESS_RAW, &recv_bm, false, NULL) ==
+           0);
+    assert(fct_receive_parallel(NULL, 0, &writer, &meta, &recv_bm, NULL, &crc_errors, &result) ==
+               0 &&
+           result == FCT_RESULT_OK && crc_errors == 0);
+    errno = 0;
+    assert(fct_send_parallel(clients, 1, &reader, &meta, FCT_COMPRESS_RAW, &recv_bm, false, NULL) ==
+               -1 &&
+           errno == EINVAL);
+    errno = 0;
+    assert(fct_receive_parallel(servers, 1, &writer, &meta, &recv_bm, NULL, &crc_errors, &result) ==
+               -1 &&
+           errno == EINVAL && result == FCT_RESULT_PROTOCOL_ERROR);
+
+    progress_destroy(&send_prog_ctx);
+    progress_destroy(&recv_prog_ctx);
+    close_channels(3, clients);
+    close_channels(3, servers);
+    fct_bitmap_free(&send_bm);
+    fct_bitmap_free(&recv_bm);
+    fr_close(&reader);
+    fw_close(&writer);
+    unlink(src_path);
+    unlink(dst_path);
+
+    /* Duplicate against pre-completed bitmap & omitted chunk with partial bitmap -> PROTOCOL_ERROR.
+     */
+    const uint32_t small_cs = 1024U;
+    const uint64_t small_fs = 3U * small_cs;
+    fct_file_meta_t small_meta = make_meta(small_fs, small_cs, "partial_proto.bin");
+    assert(fw_init(&writer, dst_path, small_fs, small_cs) == 0);
+    assert(fct_bitmap_init(&recv_bm, small_meta.total_chunks) == 0);
+    assert(fct_bitmap_set(&recv_bm, 0) == 0);
+
+    fct_channel_t c1, s1;
+    make_tcp_pairs(1, &c1, &s1);
+    send_raw_chunk_manual(&c1, 0, 0, small_cs, 'A'); /* already completed! */
+    send_eor_manual(&c1);
+    errno = 0;
+    assert(fct_receive_parallel(&s1, 1, &writer, &small_meta, &recv_bm, NULL, &crc_errors,
+                                &result) == -1);
+    assert(result == FCT_RESULT_PROTOCOL_ERROR && errno == EPROTO && crc_errors == 0);
+    close_channels(1, &c1);
+    close_channels(1, &s1);
+
+    make_tcp_pairs(1, &c1, &s1);
+    send_raw_chunk_manual(&c1, 1, small_cs, small_cs, 'B'); /* chunk 2 omitted */
+    send_eor_manual(&c1);
+    errno = 0;
+    assert(fct_receive_parallel(&s1, 1, &writer, &small_meta, &recv_bm, NULL, &crc_errors,
+                                &result) == -1);
+    assert(result == FCT_RESULT_PROTOCOL_ERROR && errno == EPROTO && crc_errors == 0);
+    assert(fct_bitmap_get(&recv_bm, 0) && fct_bitmap_get(&recv_bm, 1) &&
+           !fct_bitmap_get(&recv_bm, 2));
+    close_channels(1, &c1);
+    close_channels(1, &s1);
+
+    fct_bitmap_free(&recv_bm);
+    fw_close(&writer);
+    unlink(dst_path);
+}
+
+static void send_chunk_from_reader_with_corrupt(fct_channel_t* ch, file_reader_t* reader,
+                                                const fct_file_meta_t* meta, uint32_t chunk_id,
+                                                fct_compression_mode_t mode, bool corrupt_payload,
+                                                bool corrupt_hdr_crc) {
+    unsigned char* raw = malloc(meta->chunk_size);
+    size_t bound = fct_compress_bound(meta->chunk_size);
+    unsigned char* scratch = malloc(bound);
+    assert(raw != NULL && scratch != NULL);
+
+    ssize_t raw_len = fr_read_chunk(reader, chunk_id, raw);
+    assert(raw_len > 0);
+    uint32_t crc = fct_crc32(raw, (size_t)raw_len);
+
+    const void* payload = NULL;
+    size_t payload_len = 0;
+    uint32_t flags = 0;
+    assert(fct_encode_chunk(mode, raw, (size_t)raw_len, scratch, bound, &payload, &payload_len,
+                            &flags) == 0);
+
+    unsigned char* send_copy = malloc(payload_len);
+    assert(send_copy != NULL);
+    memcpy(send_copy, payload, payload_len);
+    if (corrupt_payload && flags == 0)
+        send_copy[payload_len / 2U] ^= 0x5AU;
+    if (corrupt_hdr_crc)
+        crc ^= 0x1U;
+
+    fct_chunk_header_t hdr = {
+        .magic = FCT_MAGIC,
+        .chunk_id = chunk_id,
+        .offset = (uint64_t)chunk_id * meta->chunk_size,
+        .payload_len = (uint32_t)payload_len,
+        .flags = flags,
+        .crc32 = crc,
+    };
+    assert(fct_channel_send_chunk_idle(ch, &hdr, send_copy, 2000) == 0);
+
+    free(send_copy);
+    free(scratch);
+    free(raw);
+}
+
+static void test_crc32_corruption_and_round2_retry(const char* dir) {
+    char src_path[256], dst_path[256];
+    snprintf(src_path, sizeof(src_path), "%s/crc_src.bin", dir);
+    snprintf(dst_path, sizeof(dst_path), "%s/crc_dst.bin", dir);
+
+    /* 1. Single-chunk CRC32 corruption (N=3, 6 chunks), then Round 2 on same open channels. */
+    {
+        const uint32_t chunk_size = 4096U;
+        const uint64_t file_size = 5U * chunk_size + 512U; /* 6 chunks */
+        write_mixed_pattern_file(src_path, file_size, chunk_size);
+        fct_file_meta_t meta = make_meta(file_size, chunk_size, "crc1.bin");
+
+        file_reader_t reader;
+        file_writer_t writer;
+        assert(fr_init(&reader, src_path, chunk_size) == 0);
+        assert(fw_init(&writer, dst_path, file_size, chunk_size) == 0);
+        prefill_writer_sentinel(&writer, 0xEE);
+
+        fct_bitmap_t recv_bm;
+        assert(fct_bitmap_init(&recv_bm, meta.total_chunks) == 0);
+
+        fct_channel_t clients[3], servers[3];
+        make_tcp_pairs(3, clients, servers);
+
+        for (uint32_t id = 0; id < meta.total_chunks; ++id) {
+            bool bad_payload = (id == 3); /* odd chunk -> RAW in AUTO mode */
+            send_chunk_from_reader_with_corrupt(&clients[id % 3], &reader, &meta, id,
+                                                FCT_COMPRESS_AUTO, bad_payload, false);
+        }
+        for (size_t i = 0; i < 3; ++i)
+            send_eor_manual(&clients[i]);
+
+        uint32_t crc_errors = 0;
+        fct_result_t result = FCT_RESULT_OK;
+        int rrc =
+            fct_receive_parallel(servers, 3, &writer, &meta, &recv_bm, NULL, &crc_errors, &result);
+        assert(rrc == 1);
+        assert(result == FCT_RESULT_CHECKSUM_ERROR);
+        assert(crc_errors == 1);
+        assert(fct_bitmap_completed(&recv_bm) == 5 && !fct_bitmap_get(&recv_bm, 3));
+        assert_writer_chunk_byte(&writer, 3, 0xEE);
+
+        /* Round 2 over the exact same 3 open channels (1 remaining < 3 channels). */
+        test_progress_t retry_prog_ctx;
+        progress_init(&retry_prog_ctx);
+        fct_progress_t retry_prog = {.on_chunk = progress_cb, .context = &retry_prog_ctx};
+
+        send_thread_args_t sargs = {
+            .channels = clients,
+            .channel_count = 3,
+            .reader = &reader,
+            .meta = &meta,
+            .mode = FCT_COMPRESS_AUTO,
+            .completed = &recv_bm,
+            .is_retry = true,
+            .progress = &retry_prog,
+        };
+        pthread_t sthread;
+        assert(pthread_create(&sthread, NULL, send_thread_entry, &sargs) == 0);
+
+        rrc =
+            fct_receive_parallel(servers, 3, &writer, &meta, &recv_bm, NULL, &crc_errors, &result);
+        assert(pthread_join(sthread, NULL) == 0);
+
+        assert(sargs.rc == 0);
+        assert(rrc == 0);
+        assert(result == FCT_RESULT_OK);
+        assert(crc_errors == 0);
+        assert(fct_bitmap_is_complete(&recv_bm));
+        assert(retry_prog_ctx.calls == 1 && retry_prog_ctx.total_raw == 0 &&
+               retry_prog_ctx.total_payload == chunk_size);
+        assert_files_equal(src_path, dst_path, file_size);
+
+        progress_destroy(&retry_prog_ctx);
+        fct_bitmap_free(&recv_bm);
+        close_channels(3, clients);
+        close_channels(3, servers);
+        fr_close(&reader);
+        fw_close(&writer);
+        unlink(src_path);
+        unlink(dst_path);
+    }
+
+    /* 2. Multi-chunk CRC32 corruption (N=4, 8 chunks, compressed + raw + short tail), then Round 2.
+     */
+    {
+        const uint32_t chunk_size = 4096U;
+        const uint64_t file_size = 7U * chunk_size + 333U; /* 8 chunks */
+        write_mixed_pattern_file(src_path, file_size, chunk_size);
+        fct_file_meta_t meta = make_meta(file_size, chunk_size, "crc_multi.bin");
+
+        file_reader_t reader;
+        file_writer_t writer;
+        assert(fr_init(&reader, src_path, chunk_size) == 0);
+        assert(fw_init(&writer, dst_path, file_size, chunk_size) == 0);
+        prefill_writer_sentinel(&writer, 0xEE);
+
+        fct_bitmap_t recv_bm;
+        assert(fct_bitmap_init(&recv_bm, meta.total_chunks) == 0);
+
+        fct_channel_t clients[4], servers[4];
+        make_tcp_pairs(4, clients, servers);
+
+        /* Corrupt compressed chunk 0 (crc mismatch after decode), raw chunk 3, and short tail
+         * chunk 7. */
+        for (uint32_t id = 0; id < meta.total_chunks; ++id) {
+            bool bad_payload = (id == 3 || id == 7);
+            bool bad_hdr_crc = (id == 0);
+            send_chunk_from_reader_with_corrupt(&clients[id % 4], &reader, &meta, id,
+                                                FCT_COMPRESS_AUTO, bad_payload, bad_hdr_crc);
+        }
+        for (size_t i = 0; i < 4; ++i)
+            send_eor_manual(&clients[i]);
+
+        uint32_t crc_errors = 0;
+        fct_result_t result = FCT_RESULT_OK;
+        int rrc =
+            fct_receive_parallel(servers, 4, &writer, &meta, &recv_bm, NULL, &crc_errors, &result);
+        assert(rrc == 1);
+        assert(result == FCT_RESULT_CHECKSUM_ERROR);
+        assert(crc_errors == 3);
+        assert(fct_bitmap_completed(&recv_bm) == 5);
+        assert(!fct_bitmap_get(&recv_bm, 0) && !fct_bitmap_get(&recv_bm, 3) &&
+               !fct_bitmap_get(&recv_bm, 7));
+        assert_writer_chunk_byte(&writer, 0, 0xEE);
+        assert_writer_chunk_byte(&writer, 3, 0xEE);
+        assert_writer_chunk_byte(&writer, 7, 0xEE);
+
+        test_progress_t retry_prog_ctx;
+        progress_init(&retry_prog_ctx);
+        fct_progress_t retry_prog = {.on_chunk = progress_cb, .context = &retry_prog_ctx};
+
+        send_thread_args_t sargs = {
+            .channels = clients,
+            .channel_count = 4,
+            .reader = &reader,
+            .meta = &meta,
+            .mode = FCT_COMPRESS_AUTO,
+            .completed = &recv_bm,
+            .is_retry = true,
+            .progress = &retry_prog,
+        };
+        pthread_t sthread;
+        assert(pthread_create(&sthread, NULL, send_thread_entry, &sargs) == 0);
+
+        rrc =
+            fct_receive_parallel(servers, 4, &writer, &meta, &recv_bm, NULL, &crc_errors, &result);
+        assert(pthread_join(sthread, NULL) == 0);
+
+        assert(sargs.rc == 0);
+        assert(rrc == 0);
+        assert(result == FCT_RESULT_OK);
+        assert(crc_errors == 0);
+        assert(fct_bitmap_is_complete(&recv_bm));
+        assert(retry_prog_ctx.calls == 3 && retry_prog_ctx.total_raw == 0 &&
+               retry_prog_ctx.total_payload > 0);
+        assert_files_equal(src_path, dst_path, file_size);
+
+        progress_destroy(&retry_prog_ctx);
+        fct_bitmap_free(&recv_bm);
+        close_channels(4, clients);
+        close_channels(4, servers);
+        fr_close(&reader);
+        fw_close(&writer);
+        unlink(src_path);
+        unlink(dst_path);
+    }
+
+    /* 3. Single-channel (N=1) CRC32 corruption + RETRY/bitmap frame + Round 2 + RESULT. */
+    {
+        const uint32_t chunk_size = 2048U;
+        const uint64_t file_size = 3U * chunk_size + 123U; /* 4 chunks */
+        write_mixed_pattern_file(src_path, file_size, chunk_size);
+        fct_file_meta_t meta = make_meta(file_size, chunk_size, "crc_n1.bin");
+
+        file_reader_t reader;
+        file_writer_t writer;
+        assert(fr_init(&reader, src_path, chunk_size) == 0);
+        assert(fw_init(&writer, dst_path, file_size, chunk_size) == 0);
+        prefill_writer_sentinel(&writer, 0xEE);
+
+        fct_bitmap_t recv_bm, send_bm;
+        assert(fct_bitmap_init(&recv_bm, meta.total_chunks) == 0);
+        assert(fct_bitmap_init(&send_bm, meta.total_chunks) == 0);
+
+        fct_channel_t client, server;
+        make_tcp_pairs(1, &client, &server);
+
+        for (uint32_t id = 0; id < meta.total_chunks; ++id) {
+            send_chunk_from_reader_with_corrupt(&client, &reader, &meta, id, FCT_COMPRESS_RAW,
+                                                id == 2, false);
+        }
+        send_eor_manual(&client);
+
+        uint32_t crc_errors = 0;
+        fct_result_t result = FCT_RESULT_OK;
+        int rrc =
+            fct_receive_parallel(&server, 1, &writer, &meta, &recv_bm, NULL, &crc_errors, &result);
+        assert(rrc == 1 && result == FCT_RESULT_CHECKSUM_ERROR && crc_errors == 1);
+        assert_writer_chunk_byte(&writer, 2, 0xEE);
+
+        struct timespec dl = deadline_after_ms(2000);
+        fct_control_frame_t retry_out = {.magic = FCT_MAGIC, .type = FCT_CONTROL_RETRY, .arg = 1};
+        retry_out.token[0] = 0x42;
+        assert(fct_channel_send_control_until(&server, &retry_out, &dl) == 0);
+        assert(fct_channel_send_bitmap_until(&server, recv_bm.bits, recv_bm.byte_len, &dl) == 0);
+
+        fct_control_frame_t retry_in = {0};
+        assert(fct_channel_recv_control_until(&client, &retry_in, &dl) == 0);
+        assert(retry_in.type == FCT_CONTROL_RETRY && retry_in.arg == 1 &&
+               retry_in.token[0] == 0x42);
+        uint8_t* wire_bits = malloc(send_bm.byte_len);
+        assert(wire_bits != NULL);
+        assert(fct_channel_recv_bitmap_until(&client, wire_bits, send_bm.byte_len, &dl) == 0);
+        assert(fct_bitmap_load_bytes(&send_bm, wire_bits, send_bm.byte_len) == 0);
+        free(wire_bits);
+
+        send_thread_args_t sargs = {
+            .channels = &client,
+            .channel_count = 1,
+            .reader = &reader,
+            .meta = &meta,
+            .mode = FCT_COMPRESS_RAW,
+            .completed = &send_bm,
+            .is_retry = true,
+        };
+        pthread_t sthread;
+        assert(pthread_create(&sthread, NULL, send_thread_entry, &sargs) == 0);
+
+        rrc =
+            fct_receive_parallel(&server, 1, &writer, &meta, &recv_bm, NULL, &crc_errors, &result);
+        assert(pthread_join(sthread, NULL) == 0);
+        assert(sargs.rc == 0 && rrc == 0 && result == FCT_RESULT_OK && crc_errors == 0);
+
+        fct_control_frame_t res_out = {
+            .magic = FCT_MAGIC, .type = FCT_CONTROL_RESULT, .arg = FCT_RESULT_OK};
+        res_out.token[0] = 0x42;
+        fct_control_frame_t res_in = {0};
+        assert(fct_channel_send_control_until(&server, &res_out, &dl) == 0);
+        assert(fct_channel_recv_control_until(&client, &res_in, &dl) == 0);
+        assert(res_in.type == FCT_CONTROL_RESULT && res_in.arg == FCT_RESULT_OK &&
+               res_in.token[0] == 0x42);
+        assert_files_equal(src_path, dst_path, file_size);
+
+        fct_bitmap_free(&send_bm);
+        fct_bitmap_free(&recv_bm);
+        close_channels(1, &client);
+        close_channels(1, &server);
+        fr_close(&reader);
+        fw_close(&writer);
+        unlink(src_path);
+        unlink(dst_path);
+    }
+}
+
 int main(void) {
     signal(SIGPIPE, SIG_IGN);
     compress_stub_reset();
@@ -789,6 +1348,9 @@ int main(void) {
     test_storage_error(dir);
     test_multi_worker_wakeup_and_transfer_error(dir);
     test_single_channel_failure_result_exchange(dir);
+    test_early_eof_before_eor(dir);
+    test_selective_bitmap_send_and_receive(dir);
+    test_crc32_corruption_and_round2_retry(dir);
 
     assert(rmdir(dir) == 0);
     puts("worker tests passed");

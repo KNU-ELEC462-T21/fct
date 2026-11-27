@@ -22,7 +22,7 @@ init:
 	sudo apt-get update
 	sudo apt-get install -y gcc clang-format zlib1g-dev
 
-test: build/network_test build/cli_test build/cli_extended_test build/progress_test build/test_file_writer build/file_reader_test build/compress_test build/worker_test build/integration_test
+test: build/network_test build/cli_test build/cli_extended_test build/progress_test build/test_file_writer build/file_reader_test build/compress_test build/checksum_test build/bitmap_test build/worker_test build/integration_test
 	./build/network_test
 	./build/cli_test
 	./build/cli_extended_test
@@ -30,6 +30,8 @@ test: build/network_test build/cli_test build/cli_extended_test build/progress_t
 	./build/test_file_writer
 	./build/file_reader_test
 	./build/compress_test
+	./build/checksum_test
+	./build/bitmap_test
 	./build/worker_test
 	./build/integration_test
 
@@ -40,6 +42,14 @@ build/file_reader_test: tests/file_reader_test.c src/file_reader.c include/file_
 build/compress_test: tests/compress_test.c src/compress.c include/compress.h include/common.h
 	mkdir -p $(@D)
 	$(CC) -Wall -Wextra -Werror -Iinclude tests/compress_test.c src/compress.c -o $@ -lz
+
+build/checksum_test: tests/checksum_test.c src/checksum.c include/checksum.h include/common.h
+	mkdir -p $(@D)
+	$(CC) -Wall -Wextra -Werror -Iinclude tests/checksum_test.c src/checksum.c -o $@ -lz
+
+build/bitmap_test: tests/bitmap_test.c src/bitmap.c src/checksum.c include/bitmap.h include/checksum.h include/common.h
+	mkdir -p $(@D)
+	$(CC) -Wall -Wextra -Werror -Iinclude tests/bitmap_test.c src/bitmap.c src/checksum.c -o $@ -lz
 
 build/test_file_writer: tests/test_file_writer.c src/file_writer.c include/file_writer.h
 	mkdir -p $(@D)
@@ -61,13 +71,13 @@ build/network_test: tests/network_test.c src/network.c include/network.h include
 	mkdir -p $(@D)
 	$(CC) -std=c11 -Wall -Wextra -Werror -Iinclude tests/network_test.c src/network.c -o $@
 
-build/worker_test: tests/worker_test.c tests/compress_stub.c tests/compress_stub.h src/worker.c src/network.c src/file_reader.c src/file_writer.c include/worker.h include/bitmap.h include/network.h include/compress.h include/file_reader.h include/file_writer.h include/common.h
+build/worker_test: tests/worker_test.c tests/compress_stub.c tests/compress_stub.h src/worker.c src/network.c src/checksum.c src/bitmap.c src/file_reader.c src/file_writer.c include/worker.h include/bitmap.h include/checksum.h include/network.h include/compress.h include/file_reader.h include/file_writer.h include/common.h
 	mkdir -p $(@D)
-	$(CC) -Wall -Wextra -Werror -Iinclude tests/worker_test.c tests/compress_stub.c src/worker.c src/network.c src/file_reader.c src/file_writer.c -o $@ -lpthread
+	$(CC) -Wall -Wextra -Werror -Iinclude tests/worker_test.c tests/compress_stub.c src/worker.c src/network.c src/checksum.c src/bitmap.c src/file_reader.c src/file_writer.c -o $@ -lz -lpthread
 
-build/integration_test: $(TARGET) tests/integration_test.c src/network.c src/compress.c include/network.h include/compress.h include/common.h
+build/integration_test: $(TARGET) tests/integration_test.c src/network.c src/compress.c src/checksum.c include/network.h include/compress.h include/checksum.h include/common.h
 	mkdir -p $(@D)
-	$(CC) -std=c11 -Wall -Wextra -Werror -Iinclude tests/integration_test.c src/network.c src/compress.c -o $@ -lz -lpthread
+	$(CC) -std=c11 -Wall -Wextra -Werror -Iinclude tests/integration_test.c src/network.c src/compress.c src/checksum.c -o $@ -lz -lpthread
 
 format:
 	find src include -type f \( -name '*.c' -o -name '*.h' \) -exec $(CLANG_FORMAT) -i {} +
