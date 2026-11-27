@@ -11,6 +11,14 @@ typedef enum {
     FCT_COMPRESS_FORCE,
 } fct_compression_mode_t;
 
+typedef enum {
+    FCT_COMPRESS_REASON_AUTO,
+    FCT_COMPRESS_REASON_FORCE,
+    FCT_COMPRESS_REASON_EMPTY,
+    FCT_COMPRESS_REASON_COMPRESSED_FORMAT,
+    FCT_COMPRESS_REASON_LOW_RATIO,
+} fct_compression_reason_t;
+
 /* Maximum zlib payload for a raw length in [0, DEFAULT_CHUNK_SZ].
  * Returns 0 with errno set for an out-of-range length. */
 size_t fct_compress_bound(size_t raw_len);
@@ -22,6 +30,15 @@ size_t fct_compress_bound(size_t raw_len);
  * must hold fct_compress_bound(len) bytes. */
 int fct_compression_mode(const char* filename, const void* first_chunk, size_t len, bool force,
                          void* scratch, size_t capacity, fct_compression_mode_t* mode);
+
+/* Same as fct_compression_mode, and optionally records the selection reason
+ * in *reason when reason is non-NULL. */
+int fct_compression_mode_ex(const char* filename, const void* first_chunk, size_t len, bool force,
+                            void* scratch, size_t capacity, fct_compression_mode_t* mode,
+                            fct_compression_reason_t* reason);
+
+/* Human-readable compression status string for fct_compression_reason_t. */
+const char* fct_compression_reason_str(fct_compression_reason_t reason);
 
 /* Returns 0 on success or -1 with errno set. For AUTO or FORCE, scratch
  * must hold fct_compress_bound(raw_len) bytes. RAW can use NULL scratch.

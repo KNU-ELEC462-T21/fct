@@ -135,6 +135,8 @@ static void assert_files_equal(const char* a_path, const char* b_path, uint64_t 
 typedef struct {
     pthread_mutex_t mu;
     size_t calls;
+    size_t stat_calls;
+    size_t compressed_chunks;
     uint64_t total_raw;
     uint64_t total_payload;
 } test_progress_t;
@@ -142,6 +144,8 @@ typedef struct {
 static void progress_init(test_progress_t* p) {
     assert(pthread_mutex_init(&p->mu, NULL) == 0);
     p->calls = 0;
+    p->stat_calls = 0;
+    p->compressed_chunks = 0;
     p->total_raw = 0;
     p->total_payload = 0;
 }
@@ -156,6 +160,17 @@ static void progress_cb(void* ctx, size_t raw_len, size_t payload_len) {
     p->calls++;
     p->total_raw += raw_len;
     p->total_payload += payload_len;
+    pthread_mutex_unlock(&p->mu);
+}
+
+static void progress_stat_cb(void* ctx, size_t raw_len, size_t payload_len, bool compressed) {
+    (void)raw_len;
+    (void)payload_len;
+    test_progress_t* p = ctx;
+    pthread_mutex_lock(&p->mu);
+    p->stat_calls++;
+    if (compressed)
+        p->compressed_chunks++;
     pthread_mutex_unlock(&p->mu);
 }
 
@@ -216,8 +231,10 @@ static void run_parallel_roundtrip(const char* dir, uint64_t file_size, uint32_t
     test_progress_t recv_prog_ctx;
     progress_init(&send_prog_ctx);
     progress_init(&recv_prog_ctx);
-    fct_progress_t send_prog = {.on_chunk = progress_cb, .context = &send_prog_ctx};
-    fct_progress_t recv_prog = {.on_chunk = progress_cb, .context = &recv_prog_ctx};
+    fct_progress_t send_prog = {
+        .on_chunk = progress_cb, .on_chunk_stat = progress_stat_cb, .context = &send_prog_ctx};
+    fct_progress_t recv_prog = {
+        .on_chunk = progress_cb, .on_chunk_stat = progress_stat_cb, .context = &recv_prog_ctx};
 
     send_thread_args_t sargs = {
         .channels = clients,
@@ -241,18 +258,31 @@ static void run_parallel_roundtrip(const char* dir, uint64_t file_size, uint32_t
 
     assert(send_prog_ctx.calls == meta.total_chunks);
     assert(recv_prog_ctx.calls == meta.total_chunks);
+    assert(send_prog_ctx.stat_calls == meta.total_chunks);
+    assert(recv_prog_ctx.stat_calls == meta.total_chunks);
+    assert(send_prog_ctx.compressed_chunks == recv_prog_ctx.compressed_chunks);
     assert(send_prog_ctx.total_raw == file_size);
     assert(recv_prog_ctx.total_raw == file_size);
     assert(send_prog_ctx.total_payload == recv_prog_ctx.total_payload);
 
     if (mode == FCT_COMPRESS_RAW) {
         assert(recv_prog_ctx.total_payload == file_size);
+        assert(recv_prog_ctx.compressed_chunks == 0);
     } else if (mode == FCT_COMPRESS_AUTO && meta.total_chunks >= 1) {
+        size_t expected_comp = 0;
+        for (uint32_t id = 0; id < meta.total_chunks; ++id) {
+            uint64_t off = (uint64_t)id * chunk_size;
+            size_t len = (file_size - off) < chunk_size ? (size_t)(file_size - off) : chunk_size;
+            if (id % 2 == 0 && len >= 8)
+                expected_comp++;
+        }
+        assert(recv_prog_ctx.compressed_chunks == expected_comp);
         /* Chunk 0 is uniform and shrinks to 7 bytes (< chunk_size >= 8 or similar). */
         if (chunk_size >= 8)
             assert(recv_prog_ctx.total_payload < file_size);
     } else if (mode == FCT_COMPRESS_FORCE && meta.total_chunks >= 2) {
         assert(recv_prog_ctx.total_payload != file_size);
+        assert(recv_prog_ctx.compressed_chunks == meta.total_chunks);
     }
 
     if (n_workers == 1) {
@@ -939,8 +969,10 @@ static void test_selective_bitmap_send_and_receive(const char* dir) {
     test_progress_t send_prog_ctx, recv_prog_ctx;
     progress_init(&send_prog_ctx);
     progress_init(&recv_prog_ctx);
-    fct_progress_t send_prog = {.on_chunk = progress_cb, .context = &send_prog_ctx};
-    fct_progress_t recv_prog = {.on_chunk = progress_cb, .context = &recv_prog_ctx};
+    fct_progress_t send_prog = {
+        .on_chunk = progress_cb, .on_chunk_stat = progress_stat_cb, .context = &send_prog_ctx};
+    fct_progress_t recv_prog = {
+        .on_chunk = progress_cb, .on_chunk_stat = progress_stat_cb, .context = &recv_prog_ctx};
 
     send_thread_args_t sargs = {
         .channels = clients,

@@ -191,7 +191,10 @@ static int wait_pid_timeout(pid_t pid, int timeout_ms, int* exit_code) {
     return -1;
 }
 
-static pid_t spawn_server_ready(const char* out_dir, int* out_port) {
+static pid_t spawn_server_ready_ex(const char* out_dir, int* out_port, int* out_err_fd,
+                                   char* init_buf, size_t init_cap) {
+    if (out_err_fd)
+        *out_err_fd = -1;
     for (int attempt = 0; attempt < 20; ++attempt) {
         int port = g_next_port++;
         if (g_next_port > 60000)
@@ -213,15 +216,18 @@ static pid_t spawn_server_ready(const char* out_dir, int* out_port) {
         }
 
         close(err_pipe[1]);
-        char buf[512];
+        char local_buf[512];
+        char* buf = (init_buf && init_cap > 0) ? init_buf : local_buf;
+        size_t cap = (init_buf && init_cap > 0) ? init_cap : sizeof(local_buf);
         size_t pos = 0;
+        buf[0] = '\0';
         bool ready = false;
         int elapsed = 0;
         while (elapsed < 5000) {
             struct pollfd pfd = {.fd = err_pipe[0], .events = POLLIN};
             int prc = poll(&pfd, 1, 50);
             if (prc > 0) {
-                ssize_t n = read(err_pipe[0], buf + pos, sizeof(buf) - 1 - pos);
+                ssize_t n = read(err_pipe[0], buf + pos, cap - 1 - pos);
                 if (n <= 0)
                     break;
                 pos += (size_t)n;
@@ -230,17 +236,21 @@ static pid_t spawn_server_ready(const char* out_dir, int* out_port) {
                     ready = true;
                     break;
                 }
-                if (pos == sizeof(buf) - 1)
+                if (pos == cap - 1)
                     break;
             } else {
                 elapsed += 50;
             }
         }
-        close(err_pipe[0]);
         if (ready) {
+            if (out_err_fd)
+                *out_err_fd = err_pipe[0];
+            else
+                close(err_pipe[0]);
             *out_port = port;
             return pid;
         }
+        close(err_pipe[0]);
         int code = -1;
         if (wait_pid_timeout(pid, 1000, &code) < 0) {
             kill(pid, SIGKILL);
@@ -249,6 +259,22 @@ static pid_t spawn_server_ready(const char* out_dir, int* out_port) {
     }
     CHECK(false && "Failed to start server on an ephemeral port");
     return -1;
+}
+
+static pid_t spawn_server_ready(const char* out_dir, int* out_port) {
+    return spawn_server_ready_ex(out_dir, out_port, NULL, NULL, 0);
+}
+
+static void drain_fd_append(int fd, char* buf, size_t cap) {
+    size_t pos = strlen(buf);
+    while (pos < cap - 1) {
+        ssize_t n = read(fd, buf + pos, cap - 1 - pos);
+        if (n <= 0)
+            break;
+        pos += (size_t)n;
+    }
+    buf[pos] = '\0';
+    close(fd);
 }
 
 static int run_client_capture(int port, const char* file_path, const char* workers_str,
@@ -293,7 +319,8 @@ static int run_client_capture(int port, const char* file_path, const char* worke
 }
 
 static void test_e2e_case(const char* name, const unsigned char* data, size_t len,
-                          const char* workers_str, bool force_z, bool expect_empty_progress) {
+                          const char* workers_str, bool force_z, bool expect_empty_progress,
+                          const char* expected_comp_str) {
     char src_dir[64], dst_dir[64], src_path[256], dst_path[256];
     make_temp_dir(src_dir, sizeof(src_dir));
     make_temp_dir(dst_dir, sizeof(dst_dir));
@@ -314,6 +341,10 @@ static void test_e2e_case(const char* name, const unsigned char* data, size_t le
     CHECK(srv_rc == 0);
     CHECK(files_equal(src_path, dst_path));
     CHECK(!dir_has_temp_entries(dst_dir));
+    CHECK(strstr(client_err, "Sending '") != NULL);
+    CHECK(strstr(client_err, "Workers:") != NULL);
+    CHECK(strstr(client_err, expected_comp_str) != NULL);
+    CHECK(strstr(client_err, "Transfer complete (SHA-256 verified)") != NULL);
     if (expect_empty_progress) {
         CHECK(strstr(client_err, "100.00%") != NULL);
         CHECK(strstr(client_err, "Saved: —") != NULL);
@@ -336,15 +367,20 @@ static void test_all_e2e(void) {
     unsigned char* exact1 = make_text_bytes(DEFAULT_CHUNK_SZ);
     unsigned char* tail = make_text_bytes(tail_len);
 
-    test_e2e_case("raw_single.bin", rand3, three_mb, "1", false, false);
-    test_e2e_case("raw_multi.bin", rand5, five_mb + 777, "4", false, false);
-    test_e2e_case("auto_text.txt", text5, five_mb, "4", false, false);
-    test_e2e_case("skip.zip", zip3, three_mb, "4", false, false);
-    test_e2e_case("skip.mp4", mp43, three_mb, "4", false, false);
-    test_e2e_case("force.zip", zip3, three_mb, "4", true, false);
-    test_e2e_case("empty.dat", NULL, 0, "4", false, true);
-    test_e2e_case("exact_chunk.txt", exact1, DEFAULT_CHUNK_SZ, "4", false, false);
-    test_e2e_case("short_tail.txt", tail, tail_len, "4", false, false);
+    test_e2e_case("raw_single.bin", rand3, three_mb, "1", false, false,
+                  "Compression: OFF (low ratio)");
+    test_e2e_case("raw_multi.bin", rand5, five_mb + 777, "4", false, false,
+                  "Compression: OFF (low ratio)");
+    test_e2e_case("auto_text.txt", text5, five_mb, "4", false, false, "Compression: ON (auto)");
+    test_e2e_case("skip.zip", zip3, three_mb, "4", false, false,
+                  "Compression: OFF (compressed format)");
+    test_e2e_case("skip.mp4", mp43, three_mb, "4", false, false,
+                  "Compression: OFF (compressed format)");
+    test_e2e_case("force.zip", zip3, three_mb, "4", true, false, "Compression: ON (force)");
+    test_e2e_case("empty.dat", NULL, 0, "4", false, true, "Compression: OFF (empty)");
+    test_e2e_case("exact_chunk.txt", exact1, DEFAULT_CHUNK_SZ, "4", false, false,
+                  "Compression: ON (auto)");
+    test_e2e_case("short_tail.txt", tail, tail_len, "4", false, false, "Compression: ON (auto)");
 
     free(rand3);
     free(rand5);
@@ -506,12 +542,16 @@ static void run_wire_client_check(const char* filename, const unsigned char* dat
     pthread_t th;
     CHECK(pthread_create(&th, NULL, mock_server_thread, &cfg) == 0);
 
-    char err_buf[512] = {0};
+    char err_buf[2048] = {0};
     int cli_rc = run_client_capture(port, path, workers_str, force_z, err_buf, sizeof(err_buf));
     CHECK(pthread_join(th, NULL) == 0);
     close(listener);
     CHECK(cfg.ok);
     CHECK(cli_rc == expect_cli_rc);
+    if (retry_last)
+        CHECK(strstr(err_buf, "Retry 1/3: resending 1 chunk") != NULL);
+    if (expect_cli_rc == 0)
+        CHECK(strstr(err_buf, "Transfer complete (SHA-256 verified)") != NULL);
 
     remove_tree(dir);
 }
@@ -1044,6 +1084,8 @@ static void test_resume_after_disconnect(bool all_chunks_written) {
     CHECK(run_client_capture(port, src_path, "4", false, progress, sizeof(progress)) == 0);
     CHECK(wait_pid_timeout(server, 10000, &server_rc) == 0 && server_rc == 0);
     CHECK(strstr(progress, "100.00%") != NULL);
+    CHECK(strstr(progress, "Resuming: ") != NULL);
+    CHECK(strstr(progress, "Transfer complete (SHA-256 verified)") != NULL);
     CHECK(strstr(progress, all_chunks_written ? "Saved: —" : "Saved: 0.0%") != NULL);
     CHECK(files_equal(src_path, dst_path));
     CHECK(!dir_has_temp_entries(dst_dir));
@@ -1312,6 +1354,279 @@ static void test_existing_destination_preserved(void) {
     }
 }
 
+static void test_server_terminal_output(void) {
+    /* 1. Fresh compressible transfer */
+    {
+        char src_dir[64], dst_dir[64], src_path[256];
+        make_temp_dir(src_dir, sizeof(src_dir));
+        make_temp_dir(dst_dir, sizeof(dst_dir));
+        snprintf(src_path, sizeof(src_path), "%s/srv_comp.txt", src_dir);
+        const size_t len = 5 * 1024 * 1024;
+        unsigned char* data = make_text_bytes(len);
+        write_file_bytes(src_path, data, len);
+        free(data);
+
+        int port = 0, err_fd = -1, srv_rc = -1;
+        char srv_err[2048] = {0}, cli_err[2048] = {0};
+        pid_t srv = spawn_server_ready_ex(dst_dir, &port, &err_fd, srv_err, sizeof(srv_err));
+        CHECK(run_client_capture(port, src_path, "4", false, cli_err, sizeof(cli_err)) == 0);
+        CHECK(wait_pid_timeout(srv, 10000, &srv_rc) == 0 && srv_rc == 0);
+        drain_fd_append(err_fd, srv_err, sizeof(srv_err));
+
+        CHECK(strstr(srv_err, "Listening on port ") != NULL);
+        CHECK(strstr(srv_err, "(dir: ") != NULL);
+        CHECK(strstr(srv_err, "Receiving 'srv_comp.txt'") != NULL);
+        CHECK(strstr(srv_err, "Compression: ON (3/3 chunks, Saved: ") != NULL);
+        CHECK(strstr(srv_err, "Received 'srv_comp.txt' (SHA-256 verified)") != NULL);
+
+        remove_tree(src_dir);
+        remove_tree(dst_dir);
+    }
+
+    /* 2. Fresh incompressible transfer */
+    {
+        char src_dir[64], dst_dir[64], src_path[256];
+        make_temp_dir(src_dir, sizeof(src_dir));
+        make_temp_dir(dst_dir, sizeof(dst_dir));
+        snprintf(src_path, sizeof(src_path), "%s/srv_raw.zip", src_dir);
+        const size_t len = 3 * 1024 * 1024;
+        unsigned char* data = make_zip_bytes(len, 303);
+        write_file_bytes(src_path, data, len);
+        free(data);
+
+        int port = 0, err_fd = -1, srv_rc = -1;
+        char srv_err[2048] = {0}, cli_err[2048] = {0};
+        pid_t srv = spawn_server_ready_ex(dst_dir, &port, &err_fd, srv_err, sizeof(srv_err));
+        CHECK(run_client_capture(port, src_path, "2", false, cli_err, sizeof(cli_err)) == 0);
+        CHECK(wait_pid_timeout(srv, 10000, &srv_rc) == 0 && srv_rc == 0);
+        drain_fd_append(err_fd, srv_err, sizeof(srv_err));
+
+        CHECK(strstr(srv_err, "Receiving 'srv_raw.zip'") != NULL);
+        CHECK(strstr(srv_err, "Compression: OFF (0/2 chunks)") != NULL);
+        CHECK(strstr(srv_err, "Received 'srv_raw.zip' (SHA-256 verified)") != NULL);
+
+        remove_tree(src_dir);
+        remove_tree(dst_dir);
+    }
+
+    /* 3. Empty file transfer */
+    {
+        char src_dir[64], dst_dir[64], src_path[256];
+        make_temp_dir(src_dir, sizeof(src_dir));
+        make_temp_dir(dst_dir, sizeof(dst_dir));
+        snprintf(src_path, sizeof(src_path), "%s/srv_empty.dat", src_dir);
+        write_file_bytes(src_path, NULL, 0);
+
+        int port = 0, err_fd = -1, srv_rc = -1;
+        char srv_err[2048] = {0}, cli_err[2048] = {0};
+        pid_t srv = spawn_server_ready_ex(dst_dir, &port, &err_fd, srv_err, sizeof(srv_err));
+        CHECK(run_client_capture(port, src_path, "4", false, cli_err, sizeof(cli_err)) == 0);
+        CHECK(wait_pid_timeout(srv, 10000, &srv_rc) == 0 && srv_rc == 0);
+        drain_fd_append(err_fd, srv_err, sizeof(srv_err));
+
+        CHECK(strstr(srv_err, "Receiving 'srv_empty.dat'") != NULL);
+        CHECK(strstr(srv_err, "Compression: OFF (empty)") != NULL);
+        CHECK(strstr(srv_err, "Received 'srv_empty.dat' (SHA-256 verified)") != NULL);
+
+        remove_tree(src_dir);
+        remove_tree(dst_dir);
+    }
+
+    /* 4. Interrupted -> Checkpoint saved -> Resumed transfer */
+    {
+        char src_dir[64], dst_dir[64], src_path[256];
+        make_temp_dir(src_dir, sizeof(src_dir));
+        make_temp_dir(dst_dir, sizeof(dst_dir));
+        snprintf(src_path, sizeof(src_path), "%s/srv_resume.zip", src_dir);
+        const size_t tail = 123;
+        const size_t len = (size_t)DEFAULT_CHUNK_SZ + tail;
+        unsigned char* data = make_random_bytes(len, 404);
+        write_file_bytes(src_path, data, len);
+
+        fct_file_meta_t meta = {.magic = FCT_MAGIC,
+                                .file_size = len,
+                                .chunk_size = DEFAULT_CHUNK_SZ,
+                                .total_chunks = 2,
+                                .filename = "srv_resume.zip"};
+        fct_sha256_bytes(data, len, meta.file_sha256);
+
+        int port = 0, err_fd = -1, srv_rc = -1;
+        char srv_err[2048] = {0};
+        pid_t srv = spawn_server_ready_ex(dst_dir, &port, &err_fd, srv_err, sizeof(srv_err));
+        struct timespec dl = deadline_after(10000);
+        fct_channel_t ctrl = {.sockfd = -1};
+        (void)start_single_round(&ctrl, port, &meta, &dl, 1, 0);
+        send_raw_chunk(&ctrl, 0, data, DEFAULT_CHUNK_SZ, false);
+        fct_channel_close(&ctrl);
+        CHECK(wait_pid_timeout(srv, 10000, &srv_rc) == 0 && srv_rc != 0);
+        drain_fd_append(err_fd, srv_err, sizeof(srv_err));
+        CHECK(strstr(srv_err, "Checkpoint saved: 1/2 chunks (rerun to resume)") != NULL);
+
+        memset(srv_err, 0, sizeof(srv_err));
+        char cli_err[2048] = {0};
+        srv = spawn_server_ready_ex(dst_dir, &port, &err_fd, srv_err, sizeof(srv_err));
+        CHECK(run_client_capture(port, src_path, "4", false, cli_err, sizeof(cli_err)) == 0);
+        CHECK(wait_pid_timeout(srv, 10000, &srv_rc) == 0 && srv_rc == 0);
+        drain_fd_append(err_fd, srv_err, sizeof(srv_err));
+        CHECK(strstr(srv_err, "Resuming: 1/2 chunks (") != NULL);
+        CHECK(strstr(srv_err, "Received 'srv_resume.zip' (SHA-256 verified)") != NULL);
+
+        free(data);
+        remove_tree(src_dir);
+        remove_tree(dst_dir);
+    }
+
+    /* 5. Already-complete resumed transfer */
+    {
+        char src_dir[64], dst_dir[64], src_path[256];
+        make_temp_dir(src_dir, sizeof(src_dir));
+        make_temp_dir(dst_dir, sizeof(dst_dir));
+        snprintf(src_path, sizeof(src_path), "%s/srv_done.zip", src_dir);
+        const size_t tail = 123;
+        const size_t len = (size_t)DEFAULT_CHUNK_SZ + tail;
+        unsigned char* data = make_random_bytes(len, 505);
+        write_file_bytes(src_path, data, len);
+
+        fct_file_meta_t meta = {.magic = FCT_MAGIC,
+                                .file_size = len,
+                                .chunk_size = DEFAULT_CHUNK_SZ,
+                                .total_chunks = 2,
+                                .filename = "srv_done.zip"};
+        fct_sha256_bytes(data, len, meta.file_sha256);
+
+        int port = 0, err_fd = -1, srv_rc = -1;
+        char srv_err[2048] = {0};
+        pid_t srv = spawn_server_ready_ex(dst_dir, &port, &err_fd, srv_err, sizeof(srv_err));
+        struct timespec dl = deadline_after(10000);
+        fct_channel_t ctrl = {.sockfd = -1};
+        (void)start_single_round(&ctrl, port, &meta, &dl, 1, 0);
+        send_raw_chunk(&ctrl, 0, data, DEFAULT_CHUNK_SZ, false);
+        send_raw_chunk(&ctrl, 1, data + DEFAULT_CHUNK_SZ, tail, false);
+        fct_channel_close(&ctrl);
+        CHECK(wait_pid_timeout(srv, 10000, &srv_rc) == 0 && srv_rc != 0);
+        drain_fd_append(err_fd, srv_err, sizeof(srv_err));
+
+        memset(srv_err, 0, sizeof(srv_err));
+        char cli_err[2048] = {0};
+        srv = spawn_server_ready_ex(dst_dir, &port, &err_fd, srv_err, sizeof(srv_err));
+        CHECK(run_client_capture(port, src_path, "4", false, cli_err, sizeof(cli_err)) == 0);
+        CHECK(wait_pid_timeout(srv, 10000, &srv_rc) == 0 && srv_rc == 0);
+        drain_fd_append(err_fd, srv_err, sizeof(srv_err));
+        CHECK(strstr(srv_err, "Resuming: 2/2 chunks (100.00%)") != NULL);
+        CHECK(strstr(srv_err, "Compression: N/A (0 chunks received)") != NULL);
+        CHECK(strstr(srv_err, "Received 'srv_done.zip' (SHA-256 verified)") != NULL);
+
+        free(data);
+        remove_tree(src_dir);
+        remove_tree(dst_dir);
+    }
+
+    /* 6. Corrupt checkpoint recovery */
+    {
+        char src_dir[64], dst_dir[64], src_path[256];
+        make_temp_dir(src_dir, sizeof(src_dir));
+        make_temp_dir(dst_dir, sizeof(dst_dir));
+        snprintf(src_path, sizeof(src_path), "%s/srv_corrupt.bin", src_dir);
+        const size_t len = (size_t)DEFAULT_CHUNK_SZ + 123;
+        unsigned char* data = make_random_bytes(len, 606);
+        write_file_bytes(src_path, data, len);
+
+        fct_file_meta_t meta = {.magic = FCT_MAGIC,
+                                .file_size = len,
+                                .chunk_size = DEFAULT_CHUNK_SZ,
+                                .total_chunks = 2,
+                                .filename = "srv_corrupt.bin"};
+        fct_sha256_bytes(data, len, meta.file_sha256);
+
+        int port = 0, srv_rc = -1;
+        pid_t srv = spawn_server_ready(dst_dir, &port);
+        struct timespec dl = deadline_after(10000);
+        fct_channel_t ctrl = {.sockfd = -1};
+        (void)start_single_round(&ctrl, port, &meta, &dl, 1, 0);
+        send_raw_chunk(&ctrl, 0, data, DEFAULT_CHUNK_SZ, false);
+        fct_channel_close(&ctrl);
+        CHECK(wait_pid_timeout(srv, 10000, &srv_rc) == 0 && srv_rc != 0);
+
+        char session_dir[256] = {0};
+        DIR* d = opendir(dst_dir);
+        CHECK(d != NULL);
+        struct dirent* ent;
+        while ((ent = readdir(d)) != NULL) {
+            if (strncmp(ent->d_name, ".fct-", 5) == 0) {
+                snprintf(session_dir, sizeof(session_dir), "%s", ent->d_name);
+                break;
+            }
+        }
+        closedir(d);
+        CHECK(session_dir[0] != '\0');
+
+        char bitmap_path[512];
+        snprintf(bitmap_path, sizeof(bitmap_path), "%s/%s/data.bitmap", dst_dir, session_dir);
+        FILE* bf = fopen(bitmap_path, "r+b");
+        CHECK(bf != NULL);
+        int byte0 = fgetc(bf);
+        CHECK(byte0 != EOF);
+        CHECK(fseek(bf, 0, SEEK_SET) == 0);
+        CHECK(fputc(byte0 ^ 0xff, bf) != EOF);
+        CHECK(fclose(bf) == 0);
+
+        int err_fd = -1;
+        char srv_err[2048] = {0}, cli_err[2048] = {0};
+        srv = spawn_server_ready_ex(dst_dir, &port, &err_fd, srv_err, sizeof(srv_err));
+        CHECK(run_client_capture(port, src_path, "2", false, cli_err, sizeof(cli_err)) == 0);
+        CHECK(wait_pid_timeout(srv, 10000, &srv_rc) == 0 && srv_rc == 0);
+        drain_fd_append(err_fd, srv_err, sizeof(srv_err));
+        CHECK(strstr(srv_err, "Checkpoint invalid; starting fresh transfer") != NULL);
+
+        free(data);
+        remove_tree(src_dir);
+        remove_tree(dst_dir);
+    }
+
+    /* 7. CRC32 mismatch retry */
+    {
+        char dst_dir[64];
+        make_temp_dir(dst_dir, sizeof(dst_dir));
+        const size_t len = (size_t)DEFAULT_CHUNK_SZ + 19;
+        unsigned char* data = make_text_bytes(len);
+        fct_file_meta_t meta = {.magic = FCT_MAGIC,
+                                .file_size = len,
+                                .chunk_size = DEFAULT_CHUNK_SZ,
+                                .total_chunks = 2,
+                                .filename = "srv_retry.bin"};
+        fct_sha256_bytes(data, len, meta.file_sha256);
+
+        int port = 0, err_fd = -1, srv_rc = -1;
+        char srv_err[2048] = {0};
+        pid_t srv = spawn_server_ready_ex(dst_dir, &port, &err_fd, srv_err, sizeof(srv_err));
+        struct timespec dl = deadline_after(10000);
+        fct_channel_t ctrl = {.sockfd = -1};
+        fct_control_frame_t ready = start_single_round(&ctrl, port, &meta, &dl, 1, 0);
+        send_raw_chunk(&ctrl, 0, data, DEFAULT_CHUNK_SZ, false);
+        send_raw_chunk(&ctrl, 1, data + DEFAULT_CHUNK_SZ, 19, true);
+        send_eor(&ctrl);
+
+        fct_control_frame_t response;
+        CHECK(fct_channel_recv_control_until(&ctrl, &response, &dl) == 0);
+        CHECK(response.type == FCT_CONTROL_RETRY && response.arg == 1);
+        CHECK(memcmp(response.token, ready.token, sizeof(ready.token)) == 0);
+        CHECK(receive_small_bitmap(&ctrl, meta.total_chunks, &dl) == 1);
+        send_raw_chunk(&ctrl, 1, data + DEFAULT_CHUNK_SZ, 19, false);
+        send_eor(&ctrl);
+        CHECK(fct_channel_recv_control_until(&ctrl, &response, &dl) == 0);
+        CHECK(response.type == FCT_CONTROL_RESULT && response.arg == FCT_RESULT_OK);
+        fct_channel_close(&ctrl);
+
+        CHECK(wait_pid_timeout(srv, 10000, &srv_rc) == 0 && srv_rc == 0);
+        drain_fd_append(err_fd, srv_err, sizeof(srv_err));
+        CHECK(strstr(srv_err, "Retry 1/3: requesting 1 chunk (CRC32 mismatch)") != NULL);
+        CHECK(strstr(srv_err, "Received 'srv_retry.bin' (SHA-256 verified)") != NULL);
+
+        free(data);
+        remove_tree(dst_dir);
+    }
+}
+
 int main(void) {
     test_all_e2e();
     test_wire_client_behaviors();
@@ -1327,6 +1642,7 @@ int main(void) {
     test_server_checksum_result(true, false);
     test_server_rejects_invalid_filenames();
     test_existing_destination_preserved();
+    test_server_terminal_output();
     printf("integration_test: all tests passed\n");
     return 0;
 }

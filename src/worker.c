@@ -165,9 +165,14 @@ static void* send_worker_main(void* arg) {
             send_record_failure(state, errno);
             break;
         }
-        if (state->progress && state->progress->on_chunk) {
-            state->progress->on_chunk(state->progress->context,
-                                      state->is_retry ? 0 : (size_t)raw_len, payload_len);
+        if (state->progress) {
+            size_t reported_raw = state->is_retry ? 0 : (size_t)raw_len;
+            if (state->progress->on_chunk)
+                state->progress->on_chunk(state->progress->context, reported_raw, payload_len);
+            if (state->progress->on_chunk_stat) {
+                state->progress->on_chunk_stat(state->progress->context, reported_raw, payload_len,
+                                               flags == FCT_CHUNK_FLAG_COMPRESSED);
+            }
         }
     }
 
@@ -483,8 +488,14 @@ static void* recv_worker_main(void* arg) {
         state->written_count++;
         pthread_mutex_unlock(&state->mu);
 
-        if (state->progress && state->progress->on_chunk)
-            state->progress->on_chunk(state->progress->context, raw_len, hdr.payload_len);
+        if (state->progress) {
+            if (state->progress->on_chunk)
+                state->progress->on_chunk(state->progress->context, raw_len, hdr.payload_len);
+            if (state->progress->on_chunk_stat) {
+                state->progress->on_chunk_stat(state->progress->context, raw_len, hdr.payload_len,
+                                               hdr.flags == FCT_CHUNK_FLAG_COMPRESSED);
+            }
+        }
     }
 
     free(recv_buf);

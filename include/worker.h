@@ -14,8 +14,12 @@
  * excludes the header. Calls may arrive concurrently or out of order. */
 typedef void (*fct_progress_fn)(void* context, size_t raw_len, size_t payload_len);
 
+typedef void (*fct_chunk_stat_fn)(void* context, size_t raw_len, size_t payload_len,
+                                  bool compressed);
+
 typedef struct {
     fct_progress_fn on_chunk;
+    fct_chunk_stat_fn on_chunk_stat;
     void* context;
 } fct_progress_t;
 
