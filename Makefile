@@ -71,13 +71,13 @@ build/network_test: tests/network_test.c src/network.c include/network.h include
 	mkdir -p $(@D)
 	$(CC) -std=c11 -Wall -Wextra -Werror -Iinclude tests/network_test.c src/network.c -o $@
 
-build/worker_test: tests/worker_test.c tests/compress_stub.c tests/compress_stub.h src/worker.c src/network.c src/file_reader.c src/file_writer.c include/worker.h include/bitmap.h include/network.h include/compress.h include/file_reader.h include/file_writer.h include/common.h
+build/worker_test: tests/worker_test.c tests/compress_stub.c tests/compress_stub.h src/worker.c src/network.c src/checksum.c src/bitmap.c src/file_reader.c src/file_writer.c include/worker.h include/bitmap.h include/checksum.h include/network.h include/compress.h include/file_reader.h include/file_writer.h include/common.h
 	mkdir -p $(@D)
-	$(CC) -Wall -Wextra -Werror -Iinclude tests/worker_test.c tests/compress_stub.c src/worker.c src/network.c src/file_reader.c src/file_writer.c -o $@ -lpthread
+	$(CC) -Wall -Wextra -Werror -Iinclude tests/worker_test.c tests/compress_stub.c src/worker.c src/network.c src/checksum.c src/bitmap.c src/file_reader.c src/file_writer.c -o $@ -lz -lpthread
 
-build/integration_test: $(TARGET) tests/integration_test.c src/network.c src/compress.c include/network.h include/compress.h include/common.h
+build/integration_test: $(TARGET) tests/integration_test.c src/network.c src/compress.c src/checksum.c include/network.h include/compress.h include/checksum.h include/common.h
 	mkdir -p $(@D)
-	$(CC) -std=c11 -Wall -Wextra -Werror -Iinclude tests/integration_test.c src/network.c src/compress.c -o $@ -lz -lpthread
+	$(CC) -std=c11 -Wall -Wextra -Werror -Iinclude tests/integration_test.c src/network.c src/compress.c src/checksum.c -o $@ -lz -lpthread
 
 format:
 	find src include -type f \( -name '*.c' -o -name '*.h' \) -exec $(CLANG_FORMAT) -i {} +

@@ -69,7 +69,7 @@ static int open_ephemeral_listener(int* out_port) {
 
 static void test_wire_and_roundtrip(void) {
     fct_channel_t a, b;
-    unsigned char wire[276];
+    unsigned char wire[308];
     const unsigned char prefix[] = {0x46, 0x43, 0x54, 0x31, 1, 2, 3, 4, 5, 6,
                                     7,    8,    0,    0,    0, 4, 0, 0, 0, 2};
     fct_file_meta_t meta = {.magic = FCT_MAGIC,
@@ -77,33 +77,40 @@ static void test_wire_and_roundtrip(void) {
                             .chunk_size = 4,
                             .total_chunks = 2,
                             .filename = "test.bin"};
+    for (size_t i = 0; i < FCT_SHA256_SIZE; ++i)
+        meta.file_sha256[i] = (uint8_t)(0xA0U + i);
     fct_file_meta_t received;
     fct_chunk_header_t hdr = {.magic = FCT_MAGIC,
                               .chunk_id = 0x01020304,
                               .offset = UINT64_C(0x0102030405060708),
-                              .payload_len = 3};
+                              .payload_len = 3,
+                              .crc32 = 0x11223344U};
     fct_chunk_header_t got;
     char payload[3];
-    const unsigned char chunk_wire[] = {0x46, 0x43, 0x54, 0x31, 1, 2, 3, 4, 1, 2, 3,   4,   5,  6,
-                                        7,    8,    0,    0,    0, 3, 0, 0, 0, 0, 'a', 'b', 'c'};
+    const unsigned char chunk_wire[] = {0x46, 0x43, 0x54, 0x31, 1,    2,    3,   4,   1,  2, 3,
+                                        4,    5,    6,    7,    8,    0,    0,   0,   3,  0, 0,
+                                        0,    0,    0x11, 0x22, 0x33, 0x44, 'a', 'b', 'c'};
     pair(&a, &b);
     assert(fct_channel_send_meta(&a, &meta) == 0);
     assert(recv_exact(b.sockfd, wire, sizeof(wire)) == 0);
     assert(memcmp(wire, prefix, sizeof(prefix)) == 0);
     assert(memcmp(wire + 20, meta.filename, 256) == 0);
+    assert(memcmp(wire + 276, meta.file_sha256, FCT_SHA256_SIZE) == 0);
     assert(send_exact(a.sockfd, wire, sizeof(wire)) == 0);
     assert(fct_channel_recv_meta(&b, &received) == 0);
     assert(received.file_size == meta.file_size && received.chunk_size == 4 &&
-           received.total_chunks == 2 && memcmp(received.filename, meta.filename, 256) == 0);
+           received.total_chunks == 2 && memcmp(received.filename, meta.filename, 256) == 0 &&
+           memcmp(received.file_sha256, meta.file_sha256, FCT_SHA256_SIZE) == 0);
     assert(fct_channel_send_chunk(&a, &hdr, "abc") == 0);
     assert(recv_exact(b.sockfd, wire, sizeof(chunk_wire)) == 0);
     assert(memcmp(wire, chunk_wire, sizeof(chunk_wire)) == 0);
     assert(send_exact(a.sockfd, chunk_wire, sizeof(chunk_wire)) == 0);
     assert(fct_channel_recv_chunk(&b, &got, payload, sizeof(payload)) == 0);
     assert(got.chunk_id == hdr.chunk_id && got.offset == hdr.offset && got.payload_len == 3 &&
-           memcmp(payload, "abc", 3) == 0);
-    assert(a.bytes_sent == 276 + 27 && b.bytes_recv == 276 + 27);
+           got.crc32 == hdr.crc32 && memcmp(payload, "abc", 3) == 0);
+    assert(a.bytes_sent == 308 + 31 && b.bytes_recv == 308 + 31);
     hdr.payload_len = 0;
+    hdr.crc32 = 0;
     assert(fct_channel_send_chunk(&a, &hdr, NULL) == 0);
     assert(fct_channel_recv_chunk(&b, &got, NULL, 0) == 0);
     fct_channel_close(&a);
@@ -116,7 +123,7 @@ static void test_errors(void) {
     fct_chunk_header_t hdr = {.magic = FCT_MAGIC, .payload_len = 3}, got;
     fct_file_meta_t meta;
     char buf[2];
-    unsigned char invalid[276] = {0};
+    unsigned char invalid[308] = {0};
     pair(&a, &b);
     assert(fct_channel_send_chunk(&a, &hdr, "abc") == 0);
     errno = 0;
@@ -134,8 +141,8 @@ static void test_errors(void) {
     invalid[1] = 0x43;
     invalid[2] = 0x54;
     invalid[3] = 0x31;
-    invalid[23] = 2; /* undefined flag bit */
-    assert(send_exact(a.sockfd, invalid, 24) == 0);
+    invalid[23] = 4; /* undefined flag bit */
+    assert(send_exact(a.sockfd, invalid, 28) == 0);
     assert(fct_channel_recv_chunk(&b, &got, buf, sizeof(buf)) == -1 && errno == EPROTO);
     fct_channel_close(&a);
     fct_channel_close(&b);
@@ -188,16 +195,14 @@ static void test_tcp(void) {
 static void test_control_frame_wire_and_errors(void) {
     fct_channel_t a, b;
     struct timespec dl = deadline_after_ms(2000);
-    const uint16_t types[4] = {
-        FCT_CONTROL_HELLO,
-        FCT_CONTROL_READY,
-        FCT_CONTROL_DATA,
-        FCT_CONTROL_RESULT,
+    const uint16_t types[5] = {
+        FCT_CONTROL_HELLO,  FCT_CONTROL_READY, FCT_CONTROL_DATA,
+        FCT_CONTROL_RESULT, FCT_CONTROL_RETRY,
     };
 
-    /* 1. Big-endian wire layout and round-trip for all 4 control frame types. */
+    /* 1. Big-endian wire layout and round-trip for all 5 control frame types. */
     pair(&a, &b);
-    for (size_t i = 0; i < 4; ++i) {
+    for (size_t i = 0; i < 5; ++i) {
         fct_control_frame_t frame = {
             .magic = FCT_MAGIC,
             .type = types[i],
@@ -220,8 +225,8 @@ static void test_control_frame_wire_and_errors(void) {
         assert(got.magic == FCT_MAGIC && got.type == frame.type && got.arg == frame.arg);
         assert(memcmp(got.token, frame.token, FCT_TRANSFER_TOKEN_SIZE) == 0);
     }
-    assert(a.bytes_sent == 4U * FCT_CONTROL_FRAME_WIRE_SIZE);
-    assert(b.bytes_recv == 4U * FCT_CONTROL_FRAME_WIRE_SIZE);
+    assert(a.bytes_sent == 5U * FCT_CONTROL_FRAME_WIRE_SIZE);
+    assert(b.bytes_recv == 5U * FCT_CONTROL_FRAME_WIRE_SIZE);
     fct_channel_close(&a);
     fct_channel_close(&b);
 
@@ -234,11 +239,11 @@ static void test_control_frame_wire_and_errors(void) {
     bad.type = 0;
     errno = 0;
     assert(fct_channel_send_control_until(&a, &bad, &dl) == -1 && errno == EINVAL);
-    bad.type = 5;
+    bad.type = 6;
     errno = 0;
     assert(fct_channel_send_control_until(&a, &bad, &dl) == -1 && errno == EINVAL);
 
-    unsigned char raw_ctrl[FCT_CONTROL_FRAME_WIRE_SIZE] = {0x46, 0x43, 0x54, 0x31, 0, 5};
+    unsigned char raw_ctrl[FCT_CONTROL_FRAME_WIRE_SIZE] = {0x46, 0x43, 0x54, 0x31, 0, 6};
     assert(send_exact(a.sockfd, raw_ctrl, sizeof(raw_ctrl)) == 0);
     fct_control_frame_t out = {0};
     errno = 0;
@@ -281,6 +286,7 @@ static void test_compressed_chunk_flag(void) {
         .offset = 14336,
         .payload_len = sizeof(payload),
         .flags = FCT_CHUNK_FLAG_COMPRESSED,
+        .crc32 = 0xCAFEBABEU,
     };
     fct_chunk_header_t got = {0};
 
@@ -288,14 +294,15 @@ static void test_compressed_chunk_flag(void) {
     assert(fct_channel_send_chunk(&a, &hdr, payload) == 0);
     assert(fct_channel_recv_chunk(&b, &got, buf, sizeof(buf)) == 0);
     assert(got.chunk_id == 7 && got.offset == 14336 && got.payload_len == sizeof(payload) &&
-           got.flags == FCT_CHUNK_FLAG_COMPRESSED);
+           got.flags == FCT_CHUNK_FLAG_COMPRESSED && got.crc32 == 0xCAFEBABEU);
     assert(memcmp(buf, payload, sizeof(payload)) == 0);
 
     assert(fct_channel_send_chunk_idle(&a, &hdr, payload, 1000) == 0);
     memset(&got, 0, sizeof(got));
     memset(buf, 0, sizeof(buf));
     assert(fct_channel_recv_chunk_idle(&b, &got, buf, sizeof(buf), 1000) == 0);
-    assert(got.flags == FCT_CHUNK_FLAG_COMPRESSED && memcmp(buf, payload, sizeof(payload)) == 0);
+    assert(got.flags == FCT_CHUNK_FLAG_COMPRESSED && got.crc32 == 0xCAFEBABEU &&
+           memcmp(buf, payload, sizeof(payload)) == 0);
 
     /* Reject COMPRESSED flag when payload_len == 0. */
     hdr.payload_len = 0;
@@ -304,15 +311,26 @@ static void test_compressed_chunk_flag(void) {
     errno = 0;
     assert(fct_channel_send_chunk_idle(&a, &hdr, NULL, 1000) == -1 && errno == EINVAL);
 
-    /* Reject undefined flag bits on send & recv. */
+    /* Reject COMPRESSED|EOR mutual exclusion and undefined flag bits on send & recv. */
     hdr.payload_len = 3;
-    hdr.flags = FCT_CHUNK_FLAG_COMPRESSED | 2U;
+    hdr.flags = FCT_CHUNK_FLAG_COMPRESSED | FCT_CHUNK_FLAG_EOR;
     errno = 0;
     assert(fct_channel_send_chunk_idle(&a, &hdr, "abc", 1000) == -1 && errno == EINVAL);
 
-    unsigned char wire_bad[24] = {0x46, 0x43, 0x54, 0x31};
+    hdr.flags = FCT_CHUNK_FLAG_COMPRESSED | 4U;
+    errno = 0;
+    assert(fct_channel_send_chunk_idle(&a, &hdr, "abc", 1000) == -1 && errno == EINVAL);
+
+    unsigned char wire_bad[28] = {0x46, 0x43, 0x54, 0x31};
     wire_bad[23] = FCT_CHUNK_FLAG_COMPRESSED; /* payload_len == 0 with compressed flag */
     assert(send_exact(a.sockfd, wire_bad, sizeof(wire_bad)) == 0);
+    errno = 0;
+    assert(fct_channel_recv_chunk_idle(&b, &got, buf, sizeof(buf), 1000) == -1 && errno == EPROTO);
+
+    unsigned char wire_both[28 + 1] = {0x46, 0x43, 0x54, 0x31};
+    wire_both[19] = 1;
+    wire_both[23] = FCT_CHUNK_FLAG_COMPRESSED | FCT_CHUNK_FLAG_EOR;
+    assert(send_exact(a.sockfd, wire_both, sizeof(wire_both)) == 0);
     errno = 0;
     assert(fct_channel_recv_chunk_idle(&b, &got, buf, sizeof(buf), 1000) == -1 && errno == EPROTO);
 
@@ -416,9 +434,9 @@ static void test_chunk_idle_eof_and_timeout(void) {
     fct_channel_close(&b);
 
     pair(&a, &b);
-    const unsigned char partial_frame[24 + 5] = {
-        0x46, 0x43, 0x54, 0x31, 0,  0, 0, 1, 0, 0, 0, 0, 0, 0, 0,
-        0,    0,    0,    0,    16, 0, 0, 0, 0, 1, 2, 3, 4, 5,
+    const unsigned char partial_frame[28 + 5] = {
+        0x46, 0x43, 0x54, 0x31, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        0,    0,    16,   0,    0, 0, 0, 0, 0, 0, 0, 1, 2, 3, 4, 5,
     };
     assert(send_exact(a.sockfd, partial_frame, sizeof(partial_frame)) == 0);
     shutdown(a.sockfd, SHUT_WR);
@@ -434,10 +452,10 @@ static void test_chunk_idle_eof_and_timeout(void) {
     assert(pid >= 0);
     if (!pid) {
         fct_channel_close(&b);
-        const unsigned char full_frame[24 + 20] = {
-            0x46, 0x43, 0x54, 0x31, 0,   0,   0,   3,   0,   0,   0,   0,   0,   0,   0,
-            64,   0,    0,    0,    20,  0,   0,   0,   0,   'a', 'b', 'c', 'd', 'e', 'f',
-            'g',  'h',  'i',  'j',  'k', 'l', 'm', 'n', 'o', 'p', 'q', 'r', 's', 't',
+        const unsigned char full_frame[28 + 20] = {
+            0x46, 0x43, 0x54, 0x31, 0,   0,   0,   3,   0,   0,   0,   0,   0,   0,   0,   64,
+            0,    0,    0,    20,   0,   0,   0,   0,   0xA, 0xB, 0xC, 0xD, 'a', 'b', 'c', 'd',
+            'e',  'f',  'g',  'h',  'i', 'j', 'k', 'l', 'm', 'n', 'o', 'p', 'q', 'r', 's', 't',
         };
         for (size_t off = 0; off < sizeof(full_frame); off += 4) {
             if (send_exact(a.sockfd, full_frame + off, 4) < 0)
@@ -449,7 +467,8 @@ static void test_chunk_idle_eof_and_timeout(void) {
     }
     fct_channel_close(&a);
     assert(fct_channel_recv_chunk_idle(&b, &got, buf, sizeof(buf), 150) == 0);
-    assert(got.chunk_id == 3 && got.offset == 64 && got.payload_len == 20);
+    assert(got.chunk_id == 3 && got.offset == 64 && got.payload_len == 20 &&
+           got.crc32 == 0x0A0B0C0DU);
     assert(memcmp(buf, "abcdefghijklmnopqrst", 20) == 0);
     int status = 0;
     assert(waitpid(pid, &status, 0) == pid && WIFEXITED(status) && WEXITSTATUS(status) == 0);
@@ -486,6 +505,175 @@ static void test_chunk_idle_eof_and_timeout(void) {
     fct_channel_close(&b);
 }
 
+static void test_eor_chunk_header(void) {
+    fct_channel_t a, b;
+    fct_chunk_header_t eor = {.magic = FCT_MAGIC, .flags = FCT_CHUNK_FLAG_EOR};
+    fct_chunk_header_t got = {0};
+    unsigned char wire[28];
+    const unsigned char expected_wire[28] = {
+        0x46, 0x43, 0x54, 0x31, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        0,    0,    0,    0,    0, 0, 0, 0, 0, 2, 0, 0, 0, 0,
+    };
+
+    pair(&a, &b);
+    assert(fct_channel_send_chunk(&a, &eor, NULL) == 0);
+    assert(recv_exact(b.sockfd, wire, sizeof(wire)) == 0);
+    assert(memcmp(wire, expected_wire, sizeof(expected_wire)) == 0);
+
+    assert(send_exact(a.sockfd, wire, sizeof(wire)) == 0);
+    assert(fct_channel_recv_chunk(&b, &got, NULL, 0) == 0);
+    assert(got.magic == FCT_MAGIC && got.flags == FCT_CHUNK_FLAG_EOR && got.chunk_id == 0 &&
+           got.offset == 0 && got.payload_len == 0 && got.crc32 == 0);
+
+    memset(&got, 0xFF, sizeof(got));
+    assert(fct_channel_send_chunk_idle(&a, &eor, NULL, 1000) == 0);
+    assert(fct_channel_recv_chunk_idle(&b, &got, NULL, 0, 1000) == 0);
+    assert(got.flags == FCT_CHUNK_FLAG_EOR && got.chunk_id == 0 && got.offset == 0 &&
+           got.payload_len == 0 && got.crc32 == 0);
+    assert(a.bytes_sent == 56 && b.bytes_recv == 56);
+
+    /* Reject non-zero fields with EOR on send (EINVAL). */
+    fct_chunk_header_t bad = eor;
+    bad.chunk_id = 1;
+    errno = 0;
+    assert(fct_channel_send_chunk(&a, &bad, NULL) == -1 && errno == EINVAL);
+    bad = eor;
+    bad.offset = 1;
+    errno = 0;
+    assert(fct_channel_send_chunk_idle(&a, &bad, NULL, 1000) == -1 && errno == EINVAL);
+    bad = eor;
+    bad.payload_len = 1;
+    errno = 0;
+    assert(fct_channel_send_chunk_idle(&a, &bad, "x", 1000) == -1 && errno == EINVAL);
+    bad = eor;
+    bad.crc32 = 1;
+    errno = 0;
+    assert(fct_channel_send_chunk_idle(&a, &bad, NULL, 1000) == -1 && errno == EINVAL);
+
+    /* Reject malformed EOR headers on recv (EPROTO) without advancing bytes_recv. */
+    const size_t nonzero_offsets[4] = {7, 15, 19, 27};
+    for (size_t i = 0; i < 4; ++i) {
+        unsigned char raw[28];
+        unsigned char dummy = 0;
+        memcpy(raw, expected_wire, sizeof(raw));
+        raw[nonzero_offsets[i]] = 1;
+        assert(send_exact(a.sockfd, raw, sizeof(raw)) == 0);
+        if (nonzero_offsets[i] == 19)
+            assert(send_exact(a.sockfd, &dummy, 1) == 0);
+        errno = 0;
+        assert(fct_channel_recv_chunk_idle(&b, &got, &dummy, 1, 1000) == -1 && errno == EPROTO);
+        if (nonzero_offsets[i] == 19)
+            assert(recv_exact(b.sockfd, &dummy, 1) == 0);
+    }
+    assert(b.bytes_recv == 56);
+
+    fct_channel_close(&a);
+    fct_channel_close(&b);
+}
+
+static void test_bitmap_frame_wire_and_errors(void) {
+    fct_channel_t a, b;
+    struct timespec dl = deadline_after_ms(2000);
+
+    /* 1. Non-empty bitmap big-endian wire layout and round-trip. */
+    pair(&a, &b);
+    const uint8_t bits[5] = {0xA5, 0x01, 0x80, 0x00, 0x3F};
+    uint8_t recv_bits[5] = {0};
+    unsigned char wire_hdr[FCT_BITMAP_HEADER_WIRE_SIZE];
+    assert(fct_channel_send_bitmap_until(&a, bits, sizeof(bits), &dl) == 0);
+    assert(recv_exact(b.sockfd, wire_hdr, sizeof(wire_hdr)) == 0);
+    assert(wire_hdr[0] == 0x46 && wire_hdr[1] == 0x43 && wire_hdr[2] == 0x54 &&
+           wire_hdr[3] == 0x31);
+    assert(wire_hdr[4] == 0 && wire_hdr[5] == 0 && wire_hdr[6] == 0 && wire_hdr[7] == 5);
+    assert(recv_exact(b.sockfd, recv_bits, sizeof(recv_bits)) == 0);
+    assert(memcmp(recv_bits, bits, sizeof(bits)) == 0);
+
+    memset(recv_bits, 0, sizeof(recv_bits));
+    assert(fct_channel_send_bitmap_until(&a, bits, sizeof(bits), &dl) == 0);
+    assert(fct_channel_recv_bitmap_until(&b, recv_bits, sizeof(recv_bits), &dl) == 0);
+    assert(memcmp(recv_bits, bits, sizeof(bits)) == 0);
+    assert(a.bytes_sent == 2U * (8U + 5U));
+    assert(b.bytes_recv == 8U + 5U);
+    fct_channel_close(&a);
+    fct_channel_close(&b);
+
+    /* 2. Empty file bitmap (byte_len == 0, bits == NULL) round-trip. */
+    pair(&a, &b);
+    assert(fct_channel_send_bitmap_until(&a, NULL, 0, &dl) == 0);
+    assert(fct_channel_recv_bitmap_until(&b, NULL, 0, &dl) == 0);
+    assert(a.bytes_sent == 8 && b.bytes_recv == 8);
+    fct_channel_close(&a);
+    fct_channel_close(&b);
+
+    /* 3. Parameter validation (EINVAL). */
+    pair(&a, &b);
+    errno = 0;
+    assert(fct_channel_send_bitmap_until(&a, bits, FCT_MAX_BITMAP_BYTES + 1U, &dl) == -1 &&
+           errno == EINVAL);
+    errno = 0;
+    assert(fct_channel_send_bitmap_until(&a, NULL, 1, &dl) == -1 && errno == EINVAL);
+    errno = 0;
+    assert(fct_channel_recv_bitmap_until(&b, recv_bits, FCT_MAX_BITMAP_BYTES + 1U, &dl) == -1 &&
+           errno == EINVAL);
+    errno = 0;
+    assert(fct_channel_recv_bitmap_until(&b, NULL, 1, &dl) == -1 && errno == EINVAL);
+    fct_channel_close(&a);
+    fct_channel_close(&b);
+
+    /* 4. Protocol errors (bad magic, mismatched length, oversized wire length) -> EPROTO. */
+    pair(&a, &b);
+    const unsigned char bad_magic[8] = {0x00, 0x43, 0x54, 0x31, 0, 0, 0, 1};
+    assert(send_exact(a.sockfd, bad_magic, sizeof(bad_magic)) == 0);
+    errno = 0;
+    assert(fct_channel_recv_bitmap_until(&b, recv_bits, 1, &dl) == -1 && errno == EPROTO);
+    assert(b.bytes_recv == 0);
+    fct_channel_close(&a);
+    fct_channel_close(&b);
+
+    pair(&a, &b);
+    assert(fct_channel_send_bitmap_until(&a, bits, 5, &dl) == 0);
+    errno = 0;
+    assert(fct_channel_recv_bitmap_until(&b, recv_bits, 4, &dl) == -1 && errno == EPROTO);
+    assert(b.bytes_recv == 0);
+    fct_channel_close(&a);
+    fct_channel_close(&b);
+
+    pair(&a, &b);
+    const unsigned char too_big[8] = {0x46, 0x43, 0x54, 0x31, 0x00, 0x40, 0x00, 0x01};
+    assert(send_exact(a.sockfd, too_big, sizeof(too_big)) == 0);
+    errno = 0;
+    assert(fct_channel_recv_bitmap_until(&b, recv_bits, 1, &dl) == -1 && errno == EPROTO);
+    assert(b.bytes_recv == 0);
+    fct_channel_close(&a);
+    fct_channel_close(&b);
+
+    /* 5. EOF / partial truncation -> ECONNRESET, silent peer -> ETIMEDOUT. */
+    pair(&a, &b);
+    fct_channel_close(&a);
+    errno = 0;
+    assert(fct_channel_recv_bitmap_until(&b, recv_bits, 2, &dl) == -1 && errno == ECONNRESET);
+    assert(b.bytes_recv == 0);
+    fct_channel_close(&b);
+
+    pair(&a, &b);
+    const unsigned char hdr_only[8] = {0x46, 0x43, 0x54, 0x31, 0, 0, 0, 4};
+    assert(send_exact(a.sockfd, hdr_only, sizeof(hdr_only)) == 0);
+    assert(send_exact(a.sockfd, "ab", 2) == 0);
+    fct_channel_close(&a);
+    errno = 0;
+    assert(fct_channel_recv_bitmap_until(&b, recv_bits, 4, &dl) == -1 && errno == ECONNRESET);
+    assert(b.bytes_recv == 0);
+    fct_channel_close(&b);
+
+    pair(&a, &b);
+    struct timespec short_dl = deadline_after_ms(50);
+    errno = 0;
+    assert(fct_channel_recv_bitmap_until(&b, recv_bits, 1, &short_dl) == -1 && errno == ETIMEDOUT);
+    assert(b.bytes_recv == 0);
+    fct_channel_close(&a);
+    fct_channel_close(&b);
+}
+
 int main(void) {
     signal(SIGPIPE, SIG_DFL);
     test_wire_and_roundtrip();
@@ -494,6 +682,8 @@ int main(void) {
     test_tcp();
     test_control_frame_wire_and_errors();
     test_compressed_chunk_flag();
+    test_eor_chunk_header();
+    test_bitmap_frame_wire_and_errors();
     test_deadline_connect_accept_and_io();
     test_chunk_idle_eof_and_timeout();
     puts("network tests passed");

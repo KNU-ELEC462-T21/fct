@@ -1,5 +1,6 @@
 #define _POSIX_C_SOURCE 200809L
 
+#include "checksum.h"
 #include "common.h"
 #include "compress.h"
 #include "network.h"
@@ -411,9 +412,9 @@ static void* mock_server_thread(void* arg) {
         for (;;) {
             fct_chunk_header_t hdr;
             int rc = fct_channel_recv_chunk_idle(&data[i], &hdr, buf, cap, 5000);
-            if (rc == 1)
-                break;
             CHECK(rc == 0);
+            if (hdr.flags == FCT_CHUNK_FLAG_EOR)
+                break;
             uint64_t off = (uint64_t)hdr.chunk_id * meta.chunk_size;
             uint64_t rem = meta.file_size - off;
             size_t raw_len = rem < meta.chunk_size ? (size_t)rem : meta.chunk_size;
@@ -504,6 +505,11 @@ static void test_wire_client_behaviors(void) {
     free(rand_buf);
 }
 
+static void send_eor(fct_channel_t* ch) {
+    fct_chunk_header_t eor = {.magic = FCT_MAGIC, .flags = FCT_CHUNK_FLAG_EOR};
+    CHECK(fct_channel_send_chunk_idle(ch, &eor, NULL, 5000) == 0);
+}
+
 static void test_server_out_of_order_multi(void) {
     char dst_dir[64];
     make_temp_dir(dst_dir, sizeof(dst_dir));
@@ -554,11 +560,12 @@ static void test_server_out_of_order_multi(void) {
             .offset = off,
             .payload_len = (uint32_t)chunk_len,
             .flags = 0,
+            .crc32 = fct_crc32(data + off, chunk_len),
         };
         CHECK(fct_channel_send_chunk_idle(chs[i], &hdr, data + off, 5000) == 0);
     }
-    CHECK(shutdown(d0.sockfd, SHUT_WR) == 0);
-    CHECK(shutdown(d1.sockfd, SHUT_WR) == 0);
+    send_eor(&d0);
+    send_eor(&d1);
 
     fct_control_frame_t res;
     CHECK(fct_channel_recv_control_until(&ctrl, &res, &dl) == 0);
@@ -608,14 +615,14 @@ static void test_server_single_conn_failure_result(void) {
     CHECK(fct_channel_recv_control_until(&ctrl, &ready, &dl) == 0);
     CHECK(ready.type == FCT_CONTROL_READY && ready.arg == 1);
 
-    /* Send raw wire chunk header with invalid flags = 2 directly on socket. */
-    unsigned char raw[24 + 16] = {0};
+    /* Send raw wire chunk header with invalid flags = 4 directly on socket. */
+    unsigned char raw[28 + 16] = {0};
     raw[0] = 0x46;
     raw[1] = 0x43;
     raw[2] = 0x54;
     raw[3] = 0x31;
     raw[19] = 16; /* payload_len = 16 */
-    raw[23] = 2;  /* flags = 2 (invalid) */
+    raw[23] = 4;  /* flags = 4 (invalid) */
     CHECK(send_exact(ctrl.sockfd, raw, sizeof(raw)) == 0);
 
     fct_control_frame_t res;
@@ -676,16 +683,18 @@ static void test_server_lost_result_after_publish(void) {
                              .chunk_id = 0,
                              .offset = 0,
                              .payload_len = DEFAULT_CHUNK_SZ,
-                             .flags = 0};
+                             .flags = 0,
+                             .crc32 = fct_crc32(data, DEFAULT_CHUNK_SZ)};
     fct_chunk_header_t h1 = {.magic = FCT_MAGIC,
                              .chunk_id = 1,
                              .offset = DEFAULT_CHUNK_SZ,
                              .payload_len = 512,
-                             .flags = 0};
+                             .flags = 0,
+                             .crc32 = fct_crc32(data + DEFAULT_CHUNK_SZ, 512)};
     CHECK(fct_channel_send_chunk_idle(&d0, &h0, data, 5000) == 0);
     CHECK(fct_channel_send_chunk_idle(&d1, &h1, data + DEFAULT_CHUNK_SZ, 5000) == 0);
-    CHECK(shutdown(d0.sockfd, SHUT_WR) == 0);
-    CHECK(shutdown(d1.sockfd, SHUT_WR) == 0);
+    send_eor(&d0);
+    send_eor(&d1);
 
     /* Drop control channel immediately so server RESULT send fails after publish. */
     fct_channel_close(&ctrl);
@@ -800,7 +809,8 @@ static void test_server_protocol_errors(void) {
                                  .chunk_id = 0,
                                  .offset = 0,
                                  .payload_len = DEFAULT_CHUNK_SZ,
-                                 .flags = 0};
+                                 .flags = 0,
+                                 .crc32 = fct_crc32(chunk0, DEFAULT_CHUNK_SZ)};
         CHECK(fct_channel_send_chunk_idle(&d0, &h0, chunk0, 5000) == 0);
         /* Send chunk 0 again on d1 (may get EPIPE if server already aborted). */
         (void)fct_channel_send_chunk_idle(&d1, &h0, chunk0, 5000);
@@ -855,11 +865,12 @@ static void test_server_protocol_errors(void) {
                                  .chunk_id = 0,
                                  .offset = 0,
                                  .payload_len = DEFAULT_CHUNK_SZ,
-                                 .flags = 0};
+                                 .flags = 0,
+                                 .crc32 = fct_crc32(chunk0, DEFAULT_CHUNK_SZ)};
         CHECK(fct_channel_send_chunk_idle(&d0, &h0, chunk0, 5000) == 0);
         free(chunk0);
-        CHECK(shutdown(d0.sockfd, SHUT_WR) == 0);
-        CHECK(shutdown(d1.sockfd, SHUT_WR) == 0);
+        send_eor(&d0);
+        send_eor(&d1);
 
         fct_control_frame_t res;
         CHECK(fct_channel_recv_control_until(&ctrl, &res, &dl) == 0);
@@ -895,8 +906,8 @@ static void test_server_protocol_errors(void) {
         fct_control_frame_t ready;
         CHECK(fct_channel_recv_control_until(&ctrl, &ready, &dl) == 0);
 
-        /* Send valid 24-byte chunk header claiming 1024 bytes, but only 100 bytes of payload. */
-        unsigned char raw[24 + 100] = {0};
+        /* Send valid 28-byte chunk header claiming 1024 bytes, but only 100 bytes of payload. */
+        unsigned char raw[28 + 100] = {0};
         raw[0] = 0x46;
         raw[1] = 0x43;
         raw[2] = 0x54;
