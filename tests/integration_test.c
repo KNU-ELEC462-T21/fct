@@ -355,12 +355,21 @@ static void test_all_e2e(void) {
     free(tail);
 }
 
+static uint8_t receive_small_bitmap(fct_channel_t* control, uint32_t chunks,
+                                    const struct timespec* deadline) {
+    uint8_t bits = 0;
+    CHECK(chunks <= 8);
+    CHECK(fct_channel_recv_bitmap_until(control, &bits, chunks != 0, deadline) == 0);
+    return bits;
+}
+
 typedef struct {
     int listener;
     uint16_t expected_workers;
     bool expect_compressed;
     bool expect_raw;
     bool drop_result;
+    bool retry_last;
     size_t saw_compressed;
     size_t saw_raw;
     uint32_t received_chunks;
@@ -388,6 +397,8 @@ static void* mock_server_thread(void* arg) {
     fct_control_frame_t ready = {.magic = FCT_MAGIC, .type = FCT_CONTROL_READY, .arg = hello.arg};
     memcpy(ready.token, token, FCT_TRANSFER_TOKEN_SIZE);
     CHECK(fct_channel_send_control_until(&ctrl, &ready, &dl) == 0);
+    uint8_t completed = 0;
+    CHECK(fct_channel_send_bitmap_until(&ctrl, &completed, 1, &dl) == 0);
 
     bool seen_idx[FCT_MAX_DATA_WORKERS] = {false};
     for (uint16_t i = 0; i < hello.arg; ++i) {
@@ -429,8 +440,30 @@ static void* mock_server_thread(void* arg) {
             }
             cfg->received_chunks++;
         }
-        fct_channel_close(&data[i]);
     }
+    if (cfg->retry_last) {
+        fct_control_frame_t retry = ready;
+        retry.type = FCT_CONTROL_RETRY;
+        retry.arg = 1;
+        uint32_t last = meta.total_chunks - 1;
+        completed = (uint8_t)((1U << last) - 1);
+        CHECK(fct_channel_send_control_until(&ctrl, &retry, &dl) == 0);
+        CHECK(fct_channel_send_bitmap_until(&ctrl, &completed, 1, &dl) == 0);
+        unsigned retried = 0;
+        for (uint16_t i = 0; i < hello.arg; ++i) {
+            for (;;) {
+                fct_chunk_header_t hdr;
+                CHECK(fct_channel_recv_chunk_idle(&data[i], &hdr, buf, cap, 5000) == 0);
+                if (hdr.flags == FCT_CHUNK_FLAG_EOR)
+                    break;
+                CHECK(hdr.chunk_id == last);
+                ++retried;
+            }
+        }
+        CHECK(retried == 1);
+    }
+    for (uint16_t i = 0; i < hello.arg; ++i)
+        fct_channel_close(&data[i]);
     free(buf);
     CHECK(cfg->received_chunks == meta.total_chunks);
     if (cfg->expect_compressed)
@@ -452,7 +485,7 @@ static void* mock_server_thread(void* arg) {
 static void run_wire_client_check(const char* filename, const unsigned char* data, size_t len,
                                   const char* workers_str, uint16_t expected_workers, bool force_z,
                                   bool expect_compressed, bool expect_raw, bool drop_result,
-                                  int expect_cli_rc) {
+                                  bool retry_last, int expect_cli_rc) {
     char dir[64], path[256];
     make_temp_dir(dir, sizeof(dir));
     snprintf(path, sizeof(path), "%s/%s", dir, filename);
@@ -468,6 +501,7 @@ static void run_wire_client_check(const char* filename, const unsigned char* dat
         .expect_compressed = expect_compressed,
         .expect_raw = expect_raw,
         .drop_result = drop_result,
+        .retry_last = retry_last,
     };
     pthread_t th;
     CHECK(pthread_create(&th, NULL, mock_server_thread, &cfg) == 0);
@@ -490,15 +524,16 @@ static void test_wire_client_behaviors(void) {
     unsigned char* rand_buf = make_random_bytes(five_mb_plus, 88);
 
     /* Multi-TCP auto compression uses 3 chunks -> 3 workers with -t 4, all compressed. */
-    run_wire_client_check("wire.txt", text, five_mb, "4", 3, false, true, false, false, 0);
+    run_wire_client_check("wire.txt", text, five_mb, "4", 3, false, true, false, false, false, 0);
     /* Auto-skip on ZIP and incompressible random data. */
-    run_wire_client_check("wire.zip", zip, five_mb_plus, "4", 3, false, false, true, false, 0);
-    run_wire_client_check("wire.bin", rand_buf, five_mb_plus, "4", 3, false, false, true, false, 0);
+    run_wire_client_check("wire.zip", zip, five_mb_plus, "4", 3, false, false, true, false, false, 0);
+    run_wire_client_check("wire.bin", rand_buf, five_mb_plus, "4", 3, false, false, true, false,
+                          true, 0);
     /* -z forces compression even on random data. */
     run_wire_client_check("force.bin", rand_buf, five_mb_plus, "4", 3, true, false, false, false,
-                          0);
+                          false, 0);
     /* Lost RESULT after transfer must cause non-zero client exit. */
-    run_wire_client_check("lost_res.txt", text, five_mb, "4", 3, false, true, false, true, 1);
+    run_wire_client_check("lost_res.txt", text, five_mb, "4", 3, false, true, false, true, false, 1);
 
     free(text);
     free(zip);
@@ -532,11 +567,13 @@ static void test_server_out_of_order_multi(void) {
         .filename = "ooo.txt",
     };
     CHECK(fct_channel_send_control_until(&ctrl, &hello, &dl) == 0);
+    fct_sha256_bytes(data, len, meta.file_sha256);
     CHECK(fct_channel_send_meta_until(&ctrl, &meta, &dl) == 0);
 
     fct_control_frame_t ready;
     CHECK(fct_channel_recv_control_until(&ctrl, &ready, &dl) == 0);
     CHECK(ready.type == FCT_CONTROL_READY && ready.arg == 2);
+    CHECK(receive_small_bitmap(&ctrl, meta.total_chunks, &dl) == 0);
 
     CHECK(fct_channel_connect_until(&d0, "127.0.0.1", port, &dl) == 0);
     CHECK(fct_channel_connect_until(&d1, "127.0.0.1", port, &dl) == 0);
@@ -614,6 +651,7 @@ static void test_server_single_conn_failure_result(void) {
     fct_control_frame_t ready;
     CHECK(fct_channel_recv_control_until(&ctrl, &ready, &dl) == 0);
     CHECK(ready.type == FCT_CONTROL_READY && ready.arg == 1);
+    CHECK(receive_small_bitmap(&ctrl, meta.total_chunks, &dl) == 0);
 
     /* Send raw wire chunk header with invalid flags = 4 directly on socket. */
     unsigned char raw[28 + 16] = {0};
@@ -665,10 +703,12 @@ static void test_server_lost_result_after_publish(void) {
         .filename = "published.bin",
     };
     CHECK(fct_channel_send_control_until(&ctrl, &hello, &dl) == 0);
+    fct_sha256_bytes(data, len, meta.file_sha256);
     CHECK(fct_channel_send_meta_until(&ctrl, &meta, &dl) == 0);
 
     fct_control_frame_t ready;
     CHECK(fct_channel_recv_control_until(&ctrl, &ready, &dl) == 0);
+    CHECK(receive_small_bitmap(&ctrl, meta.total_chunks, &dl) == 0);
 
     CHECK(fct_channel_connect_until(&d0, "127.0.0.1", port, &dl) == 0);
     CHECK(fct_channel_connect_until(&d1, "127.0.0.1", port, &dl) == 0);
@@ -755,6 +795,7 @@ static void test_server_protocol_errors(void) {
         CHECK(fct_channel_send_meta_until(&ctrl, &meta, &dl) == 0);
         fct_control_frame_t ready;
         CHECK(fct_channel_recv_control_until(&ctrl, &ready, &dl) == 0);
+        CHECK(receive_small_bitmap(&ctrl, meta.total_chunks, &dl) == 0);
 
         CHECK(fct_channel_connect_until(&d0, "127.0.0.1", port, &dl) == 0);
         fct_control_frame_t bad = {.magic = FCT_MAGIC, .type = FCT_CONTROL_DATA, .arg = 2};
@@ -793,6 +834,7 @@ static void test_server_protocol_errors(void) {
         CHECK(fct_channel_send_meta_until(&ctrl, &meta, &dl) == 0);
         fct_control_frame_t ready;
         CHECK(fct_channel_recv_control_until(&ctrl, &ready, &dl) == 0);
+        CHECK(receive_small_bitmap(&ctrl, meta.total_chunks, &dl) == 0);
 
         CHECK(fct_channel_connect_until(&d0, "127.0.0.1", port, &dl) == 0);
         CHECK(fct_channel_connect_until(&d1, "127.0.0.1", port, &dl) == 0);
@@ -826,11 +868,11 @@ static void test_server_protocol_errors(void) {
         int srv_rc = -1;
         CHECK(wait_pid_timeout(srv, 10000, &srv_rc) == 0);
         CHECK(srv_rc != 0);
-        CHECK(!dir_has_temp_entries(dst_dir));
+        CHECK(dir_has_temp_entries(dst_dir));
         remove_tree(dst_dir);
     }
 
-    /* 4. Missing chunk (close data connections before sending chunk 1) */
+    /* 4. A round ending without chunk 1 preserves the validated chunk. */
     {
         char dst_dir[64];
         make_temp_dir(dst_dir, sizeof(dst_dir));
@@ -849,6 +891,7 @@ static void test_server_protocol_errors(void) {
         CHECK(fct_channel_send_meta_until(&ctrl, &meta, &dl) == 0);
         fct_control_frame_t ready;
         CHECK(fct_channel_recv_control_until(&ctrl, &ready, &dl) == 0);
+        CHECK(receive_small_bitmap(&ctrl, meta.total_chunks, &dl) == 0);
 
         CHECK(fct_channel_connect_until(&d0, "127.0.0.1", port, &dl) == 0);
         CHECK(fct_channel_connect_until(&d1, "127.0.0.1", port, &dl) == 0);
@@ -882,7 +925,7 @@ static void test_server_protocol_errors(void) {
         int srv_rc = -1;
         CHECK(wait_pid_timeout(srv, 10000, &srv_rc) == 0);
         CHECK(srv_rc != 0);
-        CHECK(!dir_has_temp_entries(dst_dir));
+        CHECK(dir_has_temp_entries(dst_dir));
         remove_tree(dst_dir);
     }
 
@@ -905,6 +948,7 @@ static void test_server_protocol_errors(void) {
         CHECK(fct_channel_send_meta_until(&ctrl, &meta, &dl) == 0);
         fct_control_frame_t ready;
         CHECK(fct_channel_recv_control_until(&ctrl, &ready, &dl) == 0);
+        CHECK(receive_small_bitmap(&ctrl, meta.total_chunks, &dl) == 0);
 
         /* Send valid 28-byte chunk header claiming 1024 bytes, but only 100 bytes of payload. */
         unsigned char raw[28 + 100] = {0};
@@ -923,6 +967,149 @@ static void test_server_protocol_errors(void) {
         CHECK(!dir_has_temp_entries(dst_dir));
         remove_tree(dst_dir);
     }
+}
+
+static fct_control_frame_t start_single_round(fct_channel_t* control, int port,
+                                               const fct_file_meta_t* meta,
+                                               const struct timespec* deadline,
+                                               uint16_t requested_workers,
+                                               uint8_t expected_bitmap) {
+    fct_control_frame_t hello = {
+        .magic = FCT_MAGIC, .type = FCT_CONTROL_HELLO, .arg = requested_workers};
+    fct_control_frame_t ready;
+    CHECK(fct_channel_connect_until(control, "127.0.0.1", port, deadline) == 0);
+    CHECK(fct_channel_send_control_until(control, &hello, deadline) == 0);
+    CHECK(fct_channel_send_meta_until(control, meta, deadline) == 0);
+    CHECK(fct_channel_recv_control_until(control, &ready, deadline) == 0);
+    CHECK(ready.type == FCT_CONTROL_READY && ready.arg == 1);
+    CHECK(receive_small_bitmap(control, meta->total_chunks, deadline) == expected_bitmap);
+    return ready;
+}
+
+static void send_raw_chunk(fct_channel_t* control, uint32_t id, const unsigned char* data,
+                           size_t len, bool bad_crc) {
+    fct_chunk_header_t header = {
+        .magic = FCT_MAGIC,
+        .chunk_id = id,
+        .offset = (uint64_t)id * DEFAULT_CHUNK_SZ,
+        .payload_len = (uint32_t)len,
+        .crc32 = fct_crc32(data, len) ^ (uint32_t)bad_crc,
+    };
+    CHECK(fct_channel_send_chunk_idle(control, &header, data, 5000) == 0);
+}
+
+static void test_resume_after_disconnect(bool all_chunks_written) {
+    char src_dir[64], dst_dir[64], src_path[256], dst_path[256];
+    make_temp_dir(src_dir, sizeof(src_dir));
+    make_temp_dir(dst_dir, sizeof(dst_dir));
+    snprintf(src_path, sizeof(src_path), "%s/resume.zip", src_dir);
+    snprintf(dst_path, sizeof(dst_path), "%s/resume.zip", dst_dir);
+    const size_t tail = 123;
+    const size_t len = (size_t)DEFAULT_CHUNK_SZ + tail;
+    unsigned char* data = make_random_bytes(len, 103);
+    write_file_bytes(src_path, data, len);
+
+    fct_file_meta_t meta = {.magic = FCT_MAGIC,
+                            .file_size = len,
+                            .chunk_size = DEFAULT_CHUNK_SZ,
+                            .total_chunks = 2,
+                            .filename = "resume.zip"};
+    fct_sha256_bytes(data, len, meta.file_sha256);
+
+    int port = 0, server_rc = -1;
+    pid_t server = spawn_server_ready(dst_dir, &port);
+    struct timespec deadline = deadline_after(10000);
+    fct_channel_t control = {.sockfd = -1};
+    (void)start_single_round(&control, port, &meta, &deadline, 1, 0);
+    /* Preserve the short tail first, with or without the other chunk. */
+    send_raw_chunk(&control, 1, data + DEFAULT_CHUNK_SZ, tail, false);
+    if (all_chunks_written)
+        send_raw_chunk(&control, 0, data, DEFAULT_CHUNK_SZ, false);
+    fct_channel_close(&control);
+    CHECK(wait_pid_timeout(server, 10000, &server_rc) == 0 && server_rc != 0);
+    CHECK(access(dst_path, F_OK) < 0 && errno == ENOENT);
+    CHECK(dir_has_temp_entries(dst_dir));
+
+    if (!all_chunks_written) {
+        server = spawn_server_ready(dst_dir, &port);
+        deadline = deadline_after(10000);
+        /* READY must advertise only the short tail and reduce two workers to one. */
+        (void)start_single_round(&control, port, &meta, &deadline, 2, 1U << 1);
+        fct_channel_close(&control);
+        CHECK(wait_pid_timeout(server, 10000, &server_rc) == 0 && server_rc != 0);
+    }
+
+    server = spawn_server_ready(dst_dir, &port);
+    char progress[2048] = {0};
+    CHECK(run_client_capture(port, src_path, "4", false, progress, sizeof(progress)) == 0);
+    CHECK(wait_pid_timeout(server, 10000, &server_rc) == 0 && server_rc == 0);
+    CHECK(strstr(progress, "100.00%") != NULL);
+    CHECK(strstr(progress, all_chunks_written ? "Saved: —" : "Saved: 0.0%") != NULL);
+    CHECK(files_equal(src_path, dst_path));
+    CHECK(!dir_has_temp_entries(dst_dir));
+
+    free(data);
+    remove_tree(src_dir);
+    remove_tree(dst_dir);
+}
+
+static void test_server_checksum_result(bool wrong_sha, bool exhaust_retries) {
+    char dst_dir[64], dst_path[256], reference[256];
+    make_temp_dir(dst_dir, sizeof(dst_dir));
+    snprintf(dst_path, sizeof(dst_path), "%s/checked.bin", dst_dir);
+    snprintf(reference, sizeof(reference), "%s/reference", dst_dir);
+
+    const size_t len = (size_t)DEFAULT_CHUNK_SZ + 19;
+    unsigned char* data = make_text_bytes(len);
+    fct_file_meta_t meta = {.magic = FCT_MAGIC,
+                            .file_size = len,
+                            .chunk_size = DEFAULT_CHUNK_SZ,
+                            .total_chunks = 2,
+                            .filename = "checked.bin"};
+    fct_sha256_bytes(data, len, meta.file_sha256);
+    if (wrong_sha)
+        meta.file_sha256[0] ^= 1;
+
+    int port = 0, server_rc = -1;
+    pid_t server = spawn_server_ready(dst_dir, &port);
+    struct timespec deadline = deadline_after(10000);
+    fct_channel_t control = {.sockfd = -1};
+    fct_control_frame_t ready = start_single_round(&control, port, &meta, &deadline, 1, 0);
+    send_raw_chunk(&control, 0, data, DEFAULT_CHUNK_SZ, false);
+    send_raw_chunk(&control, 1, data + DEFAULT_CHUNK_SZ, 19, !wrong_sha);
+    send_eor(&control);
+
+    fct_control_frame_t response;
+    if (!wrong_sha) {
+        unsigned rounds = exhaust_retries ? FCT_MAX_CHUNK_RETRIES : 1;
+        for (unsigned round = 1; round <= rounds; ++round) {
+            CHECK(fct_channel_recv_control_until(&control, &response, &deadline) == 0);
+            CHECK(response.type == FCT_CONTROL_RETRY && response.arg == round);
+            CHECK(memcmp(response.token, ready.token, sizeof(ready.token)) == 0);
+            CHECK(receive_small_bitmap(&control, meta.total_chunks, &deadline) == 1);
+            send_raw_chunk(&control, 1, data + DEFAULT_CHUNK_SZ, 19, exhaust_retries);
+            send_eor(&control);
+        }
+    }
+
+    bool success = !wrong_sha && !exhaust_retries;
+    CHECK(fct_channel_recv_control_until(&control, &response, &deadline) == 0);
+    CHECK(response.type == FCT_CONTROL_RESULT);
+    CHECK(response.arg == (success ? FCT_RESULT_OK : FCT_RESULT_CHECKSUM_ERROR));
+    CHECK(memcmp(response.token, ready.token, sizeof(ready.token)) == 0);
+    fct_channel_close(&control);
+    CHECK(wait_pid_timeout(server, 10000, &server_rc) == 0);
+    CHECK((server_rc == 0) == success);
+    if (success) {
+        write_file_bytes(reference, data, len);
+        CHECK(files_equal(reference, dst_path));
+    } else {
+        CHECK(access(dst_path, F_OK) < 0 && errno == ENOENT);
+    }
+    CHECK(dir_has_temp_entries(dst_dir) == exhaust_retries);
+
+    free(data);
+    remove_tree(dst_dir);
 }
 
 static void test_server_rejects_invalid_filenames(void) {
@@ -1012,6 +1199,11 @@ int main(void) {
     test_server_single_conn_failure_result();
     test_server_lost_result_after_publish();
     test_server_protocol_errors();
+    test_resume_after_disconnect(false);
+    test_resume_after_disconnect(true);
+    test_server_checksum_result(false, false);
+    test_server_checksum_result(false, true);
+    test_server_checksum_result(true, false);
     test_server_rejects_invalid_filenames();
     test_existing_destination_preserved();
     printf("integration_test: all tests passed\n");
