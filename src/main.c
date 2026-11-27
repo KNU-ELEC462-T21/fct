@@ -381,8 +381,7 @@ static int send_rounds(fct_channel_t* control, fct_channel_t* channels, uint16_t
 
 static int send_session(const fct_options_t* options, file_reader_t* reader,
                         const fct_file_meta_t* meta, fct_compression_mode_t mode) {
-    uint16_t requested = compute_worker_count(options->worker_count, meta->total_chunks);
-    uint16_t worker_count = requested;
+    uint16_t worker_count = compute_worker_count(options->worker_count, meta->total_chunks);
     fct_channel_t control = {.sockfd = -1};
     fct_channel_t data_channels[FCT_MAX_DATA_WORKERS];
     init_channels(data_channels, FCT_MAX_DATA_WORKERS);
@@ -575,7 +574,7 @@ typedef struct {
 } receive_session_t;
 
 static int open_receive_session(receive_session_t* session, const fct_file_meta_t* meta,
-                                int output_fd) {
+                                int output_fd, bool* discard_session) {
     /* Keep different versions of the same filename in independent sessions. */
     char geometry[64];
     int len = snprintf(geometry, sizeof(geometry), "%llu/%u/",
@@ -607,7 +606,7 @@ static int open_receive_session(receive_session_t* session, const fct_file_meta_
         return -1;
     }
 
-    /* Anchor the path-only writer and bitmap APIs to the opened directory. */
+    /* Anchor path-only writer/bitmap APIs to dir_fd via Linux procfs. */
     snprintf(session->part_path, sizeof(session->part_path), "/proc/self/fd/%d/" PART_NAME,
              session->dir_fd);
     snprintf(session->checkpoint_path, sizeof(session->checkpoint_path),
@@ -642,9 +641,12 @@ static int open_receive_session(receive_session_t* session, const fct_file_meta_
         return -1;
     }
 
-    if (fct_bitmap_init(&session->completed, meta->total_chunks) < 0)
+    if (fct_bitmap_init(&session->completed, meta->total_chunks) < 0 ||
+        fw_init(&session->writer, session->part_path, meta->file_size, meta->chunk_size) < 0) {
+        *discard_session = true;
         return -1;
-    return fw_init(&session->writer, session->part_path, meta->file_size, meta->chunk_size);
+    }
+    return 0;
 }
 
 static int checkpoint_session(receive_session_t* session, const fct_file_meta_t* meta,
@@ -676,7 +678,7 @@ static int receive_rounds(fct_channel_t* control, fct_channel_t* channels, uint1
         int saved = errno;
 
         /* Workers have joined, so the bitmap only describes complete writes. */
-        if (before != fct_bitmap_completed(&session->completed) &&
+        if (rc != 0 && before != fct_bitmap_completed(&session->completed) &&
             checkpoint_session(session, meta, output_fd) < 0) {
             *result = FCT_RESULT_STORAGE_ERROR;
             return -1;
@@ -722,8 +724,12 @@ static int receive_payload_and_publish(fct_channel_t* control, int* listener,
     int rc = 0;
     if (worker_count >= 2)
         rc = accept_data_channels(*listener, worker_count, ready.token, data_channels, &code);
-    close(*listener);
-    *listener = -1;
+    if (*listener >= 0) {
+        int accept_errno = errno;
+        close(*listener);
+        *listener = -1;
+        errno = accept_errno;
+    }
 
     if (rc == 0) {
         fct_channel_t* channels = worker_count < 2 ? control : data_channels;
@@ -771,7 +777,8 @@ static int receive_file(fct_channel_t* control, int* listener, int output_fd) {
     int result = -1;
     if (fstatat(output_fd, meta.filename, &destination, AT_SYMLINK_NOFOLLOW) == 0) {
         errno = EEXIST;
-    } else if (errno == ENOENT && open_receive_session(&session, &meta, output_fd) == 0) {
+    } else if (errno == ENOENT &&
+               open_receive_session(&session, &meta, output_fd, &discard_session) == 0) {
         result = receive_payload_and_publish(control, listener, &meta, worker_count, &session,
                                              output_fd, &discard_session);
         discard_session |= fct_bitmap_completed(&session.completed) == 0;
@@ -786,7 +793,7 @@ done:;
     int saved = errno;
     fw_close(&session.writer);
     fct_bitmap_free(&session.completed);
-    if (discard_session) {
+    if (discard_session && session.dir_fd >= 0) {
         (void)unlinkat(session.dir_fd, CHECKPOINT_NAME, 0);
         (void)unlinkat(session.dir_fd, PART_NAME, 0);
         (void)unlinkat(output_fd, session.name, AT_REMOVEDIR);

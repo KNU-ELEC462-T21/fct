@@ -1112,8 +1112,120 @@ static void test_server_checksum_result(bool wrong_sha, bool exhaust_retries) {
     remove_tree(dst_dir);
 }
 
+static void test_resume_corrupt_checkpoint_and_multiworker(void) {
+    /* 1. Corrupt checkpoint recovery falls back to a clean transfer and succeeds. */
+    {
+        char src_dir[64], dst_dir[64], src_path[256], dst_path[256];
+        make_temp_dir(src_dir, sizeof(src_dir));
+        make_temp_dir(dst_dir, sizeof(dst_dir));
+        snprintf(src_path, sizeof(src_path), "%s/corrupt.bin", src_dir);
+        snprintf(dst_path, sizeof(dst_path), "%s/corrupt.bin", dst_dir);
+
+        const size_t len = (size_t)DEFAULT_CHUNK_SZ + 123;
+        unsigned char* data = make_random_bytes(len, 211);
+        write_file_bytes(src_path, data, len);
+
+        fct_file_meta_t meta = {.magic = FCT_MAGIC,
+                                .file_size = len,
+                                .chunk_size = DEFAULT_CHUNK_SZ,
+                                .total_chunks = 2,
+                                .filename = "corrupt.bin"};
+        fct_sha256_bytes(data, len, meta.file_sha256);
+
+        int port = 0, server_rc = -1;
+        pid_t server = spawn_server_ready(dst_dir, &port);
+        struct timespec deadline = deadline_after(10000);
+        fct_channel_t control = {.sockfd = -1};
+        (void)start_single_round(&control, port, &meta, &deadline, 1, 0);
+        send_raw_chunk(&control, 0, data, DEFAULT_CHUNK_SZ, false);
+        fct_channel_close(&control);
+        CHECK(wait_pid_timeout(server, 10000, &server_rc) == 0 && server_rc != 0);
+
+        char session_dir[256] = {0};
+        DIR* d = opendir(dst_dir);
+        CHECK(d != NULL);
+        struct dirent* ent;
+        while ((ent = readdir(d)) != NULL) {
+            if (strcmp(ent->d_name, ".") == 0 || strcmp(ent->d_name, "..") == 0)
+                continue;
+            if (strncmp(ent->d_name, ".fct-", 5) == 0) {
+                snprintf(session_dir, sizeof(session_dir), "%s", ent->d_name);
+                break;
+            }
+        }
+        closedir(d);
+        CHECK(session_dir[0] != '\0');
+
+        char bitmap_path[512];
+        int n = snprintf(bitmap_path, sizeof(bitmap_path), "%s/%s/data.bitmap", dst_dir, session_dir);
+        CHECK(n > 0 && (size_t)n < sizeof(bitmap_path));
+        FILE* bf = fopen(bitmap_path, "r+b");
+        CHECK(bf != NULL);
+        int byte0 = fgetc(bf);
+        CHECK(byte0 != EOF);
+        CHECK(fseek(bf, 0, SEEK_SET) == 0);
+        CHECK(fputc(byte0 ^ 0xff, bf) != EOF);
+        CHECK(fclose(bf) == 0);
+
+        server = spawn_server_ready(dst_dir, &port);
+        char progress[2048] = {0};
+        CHECK(run_client_capture(port, src_path, "2", false, progress, sizeof(progress)) == 0);
+        CHECK(wait_pid_timeout(server, 10000, &server_rc) == 0 && server_rc == 0);
+        CHECK(files_equal(src_path, dst_path));
+        CHECK(!dir_has_temp_entries(dst_dir));
+
+        free(data);
+        remove_tree(src_dir);
+        remove_tree(dst_dir);
+    }
+
+    /* 2. Multi-worker resume with 2+ remaining chunks negotiates dedicated data channels. */
+    {
+        char src_dir[64], dst_dir[64], src_path[256], dst_path[256];
+        make_temp_dir(src_dir, sizeof(src_dir));
+        make_temp_dir(dst_dir, sizeof(dst_dir));
+        snprintf(src_path, sizeof(src_path), "%s/multi_resume.zip", src_dir);
+        snprintf(dst_path, sizeof(dst_path), "%s/multi_resume.zip", dst_dir);
+
+        const size_t len = 2 * (size_t)DEFAULT_CHUNK_SZ + 123;
+        unsigned char* data = make_random_bytes(len, 223);
+        write_file_bytes(src_path, data, len);
+
+        fct_file_meta_t meta = {.magic = FCT_MAGIC,
+                                .file_size = len,
+                                .chunk_size = DEFAULT_CHUNK_SZ,
+                                .total_chunks = 3,
+                                .filename = "multi_resume.zip"};
+        fct_sha256_bytes(data, len, meta.file_sha256);
+
+        int port = 0, server_rc = -1;
+        pid_t server = spawn_server_ready(dst_dir, &port);
+        struct timespec deadline = deadline_after(10000);
+        fct_channel_t control = {.sockfd = -1};
+        (void)start_single_round(&control, port, &meta, &deadline, 1, 0);
+        send_raw_chunk(&control, 0, data, DEFAULT_CHUNK_SZ, false);
+        fct_channel_close(&control);
+        CHECK(wait_pid_timeout(server, 10000, &server_rc) == 0 && server_rc != 0);
+        CHECK(dir_has_temp_entries(dst_dir));
+
+        server = spawn_server_ready(dst_dir, &port);
+        char progress[2048] = {0};
+        CHECK(run_client_capture(port, src_path, "4", false, progress, sizeof(progress)) == 0);
+        CHECK(wait_pid_timeout(server, 10000, &server_rc) == 0 && server_rc == 0);
+        CHECK(strstr(progress, "100.00%") != NULL);
+        CHECK(files_equal(src_path, dst_path));
+        CHECK(!dir_has_temp_entries(dst_dir));
+
+        free(data);
+        remove_tree(src_dir);
+        remove_tree(dst_dir);
+    }
+}
+
 static void test_server_rejects_invalid_filenames(void) {
-    const char* names[] = {"", ".", "..", "../escape", "/absolute", "subdir/file"};
+    static const char reserved[] =
+        ".fct-0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    const char* names[] = {"", ".", "..", "../escape", "/absolute", "subdir/file", reserved};
     for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); ++i) {
         char dst_dir[64];
         make_temp_dir(dst_dir, sizeof(dst_dir));
@@ -1139,6 +1251,14 @@ static void test_server_rejects_invalid_filenames(void) {
         CHECK(!dir_has_temp_entries(dst_dir));
         CHECK(rmdir(dst_dir) == 0);
     }
+
+    /* Client must also reject sending a file with a reserved session directory name. */
+    char src_dir[64], src_path[256], err_buf[512] = {0};
+    make_temp_dir(src_dir, sizeof(src_dir));
+    snprintf(src_path, sizeof(src_path), "%s/%s", src_dir, reserved);
+    write_file_bytes(src_path, NULL, 0);
+    CHECK(run_client_capture(19199, src_path, "1", false, err_buf, sizeof(err_buf)) != 0);
+    remove_tree(src_dir);
 }
 
 static void test_existing_destination_preserved(void) {
@@ -1201,6 +1321,7 @@ int main(void) {
     test_server_protocol_errors();
     test_resume_after_disconnect(false);
     test_resume_after_disconnect(true);
+    test_resume_corrupt_checkpoint_and_multiworker();
     test_server_checksum_result(false, false);
     test_server_checksum_result(false, true);
     test_server_checksum_result(true, false);

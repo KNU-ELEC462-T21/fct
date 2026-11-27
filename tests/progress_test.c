@@ -100,6 +100,7 @@ static void test_resumed_progress(void) {
     fct_progress_set_resumed(NULL, mib);
     fct_progress_set_resumed(&state, 3 * mib);
     fct_progress_set_resumed(&state, 4 * mib);
+    state.started_at.tv_sec -= 1;
     fct_progress_finish(&state);
     read_stream(out, buf, sizeof(buf));
     CHECK(strstr(buf, "50.00% | 0.00 MiB/s | Saved: — | ETA: —") != NULL);
