@@ -17,7 +17,7 @@
  *   magic(4) version(4) file_size(8) chunk_size(4) total_chunks(4)
  *   file_sha256(32) filename(256) bitmap_bytes(4) bits[bitmap_bytes]
  *   file_crc32(4) = CRC32 of every byte before it. */
-#define FILENAME_SIZE 256
+#define FILENAME_SIZE (sizeof(((fct_file_meta_t*)0)->filename))
 #define HEADER_SIZE (4 + 4 + 8 + 4 + 4 + FCT_SHA256_SIZE + FILENAME_SIZE + 4)
 #define TRAILER_SIZE 4
 
@@ -71,7 +71,7 @@ static void normalize_filename(uint8_t dst[FILENAME_SIZE], const char* src) {
 }
 
 size_t fct_bitmap_byte_len(uint32_t total_chunks) {
-    return ((size_t)total_chunks + 7) / 8;
+    return (size_t)(total_chunks / 8u) + (total_chunks % 8u != 0u);
 }
 
 int fct_bitmap_init(fct_bitmap_t* bm, uint32_t total_chunks) {
@@ -123,7 +123,7 @@ int fct_bitmap_clear(fct_bitmap_t* bm, uint32_t chunk_id) {
         return -1;
     }
     if (fct_bitmap_get(bm, chunk_id)) {
-        bm->bits[chunk_id / 8] &= (uint8_t)~(1u << (chunk_id % 8));
+        bm->bits[chunk_id / 8] &= (uint8_t) ~(1u << (chunk_id % 8));
         bm->completed_chunks--;
     }
     return 0;
@@ -174,6 +174,10 @@ static int write_all(int fd, const uint8_t* buf, size_t len) {
                 continue;
             return -1;
         }
+        if (n == 0) {
+            errno = EIO;
+            return -1;
+        }
         buf += n;
         len -= (size_t)n;
     }
@@ -202,7 +206,9 @@ static int read_all(int fd, uint8_t* buf, size_t len) {
 
 int fct_bitmap_save_file(const fct_bitmap_t* bm, const fct_file_meta_t* meta, const char* path) {
     if (!bm || !meta || !path || !*path || meta->total_chunks != bm->total_chunks ||
-        (bm->byte_len > 0 && !bm->bits)) {
+        bm->byte_len != fct_bitmap_byte_len(bm->total_chunks) ||
+        bm->byte_len > FCT_MAX_BITMAP_BYTES || (bm->byte_len > 0 && !bm->bits) ||
+        !trailing_bits_clear(bm->bits, bm->byte_len, bm->total_chunks)) {
         errno = EINVAL;
         return -1;
     }
@@ -233,15 +239,16 @@ int fct_bitmap_save_file(const fct_bitmap_t* bm, const fct_file_meta_t* meta, co
 
     /* Write a temporary file next to path, flush it, then rename over path so a
      * crash leaves either the old or the new bitmap, never a partial one. */
-    static const char suffix[] = ".XXXXXX";
-    size_t path_len = strlen(path);
-    char* tmp = malloc(path_len + sizeof(suffix));
+    static const char template[] = ".fct-bm-XXXXXX";
+    const char* slash = strrchr(path, '/');
+    size_t prefix = slash ? (size_t)(slash - path) + 1 : 0;
+    char* tmp = malloc(prefix + sizeof(template));
     if (!tmp) {
         free(buf);
         return -1;
     }
-    memcpy(tmp, path, path_len);
-    memcpy(tmp + path_len, suffix, sizeof(suffix));
+    memcpy(tmp, path, prefix);
+    memcpy(tmp + prefix, template, sizeof(template));
 
     int fd = mkstemp(tmp);
     int err = 0;
@@ -268,7 +275,7 @@ int fct_bitmap_save_file(const fct_bitmap_t* bm, const fct_file_meta_t* meta, co
 }
 
 int fct_bitmap_load_file(fct_bitmap_t* bm, const fct_file_meta_t* expected_meta, const char* path) {
-    if (!bm || !expected_meta || !path) {
+    if (!bm || !expected_meta || !path || !*path) {
         errno = EINVAL;
         return -1;
     }

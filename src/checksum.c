@@ -175,7 +175,11 @@ int fct_sha256_fd(int fd, uint64_t expected_size, uint8_t out_digest[FCT_SHA256_
     }
     if (fstat(fd, &st) < 0)
         return -1;
-    if ((uint64_t)st.st_size != expected_size) {
+    if (!S_ISREG(st.st_mode)) {
+        errno = EINVAL;
+        return -1;
+    }
+    if (st.st_size < 0 || (uint64_t)st.st_size != expected_size) {
         errno = EIO;
         return -1;
     }

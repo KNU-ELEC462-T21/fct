@@ -108,6 +108,15 @@ static void test_sha256_fd(void) {
     CHECK(fct_sha256_fd(fd, len - 1, d) == -1 && errno == EIO);
     errno = 0;
     CHECK(fct_sha256_fd(-1, len, d) == -1 && errno == EINVAL);
+    errno = 0;
+    CHECK(fct_sha256_fd(fd, len, NULL) == -1 && errno == EINVAL);
+
+    int pfd[2];
+    CHECK(pipe(pfd) == 0);
+    errno = 0;
+    CHECK(fct_sha256_fd(pfd[0], 0, d) == -1 && errno == EINVAL);
+    close(pfd[0]);
+    close(pfd[1]);
 
     CHECK(ftruncate(fd, 0) == 0);
     CHECK(fct_sha256_fd(fd, 0, d) == 0);

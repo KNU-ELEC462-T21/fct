@@ -83,6 +83,11 @@ static void test_basic(void) {
         CHECK(bm.bits == NULL && bm.total_chunks == 0);
     }
     CHECK_FAILS(fct_bitmap_init(NULL, 1), EINVAL);
+
+    fct_bitmap_t max_bm;
+    CHECK(fct_bitmap_init(&max_bm, FCT_MAX_BITMAP_BYTES * 8U) == 0);
+    fct_bitmap_free(&max_bm);
+    CHECK_FAILS(fct_bitmap_init(&max_bm, FCT_MAX_BITMAP_BYTES * 8U + 1U), EINVAL);
 }
 
 static void test_load_bytes_and_superset(void) {
@@ -167,6 +172,10 @@ static void bad_version(uint8_t* b, size_t* len) {
 static void set_trailing_bit(uint8_t* b, size_t* len) {
     b[*len - 5] |= 0x80; /* 9 chunks: bits 1..7 of the last byte are unused */
 }
+static void bad_bitmap_bytes(uint8_t* b, size_t* len) {
+    (void)len;
+    b[315] ^= 1; /* header bitmap_bytes field (offset 312..315) */
+}
 
 static void test_file_roundtrip(void) {
     fct_file_meta_t meta = make_meta(9);
@@ -197,6 +206,7 @@ static void test_file_roundtrip(void) {
     check_rejects(&meta, bad_magic, true);
     check_rejects(&meta, bad_version, true);
     check_rejects(&meta, set_trailing_bit, true);
+    check_rejects(&meta, bad_bitmap_bytes, true);
 
     /* A bitmap from a different transfer is rejected. */
     fct_file_meta_t other = meta;
@@ -225,8 +235,26 @@ static void test_file_roundtrip(void) {
     CHECK_FAILS(fct_bitmap_save_file(&bm, &meta, bad_path), ENOENT);
     fct_file_meta_t wrong = make_meta(8);
     CHECK_FAILS(fct_bitmap_save_file(&bm, &wrong, path), EINVAL);
+    fct_bitmap_t bad_bm = bm;
+    bad_bm.byte_len++;
+    CHECK_FAILS(fct_bitmap_save_file(&bad_bm, &meta, path), EINVAL);
     CHECK(fct_bitmap_load_file(&loaded, &meta, path) == 0 && fct_bitmap_completed(&loaded) == 4);
     fct_bitmap_free(&loaded);
+
+    /* Basename near NAME_MAX (255) still saves cleanly via short temp name. */
+    char long_path[320];
+    char long_name[254];
+    memset(long_name, 'a', 250);
+    memcpy(long_name + 250, ".bm", 4);
+    snprintf(long_path, sizeof(long_path), "%s/%s", dir, long_name);
+    CHECK(fct_bitmap_save_file(&bm, &meta, long_path) == 0);
+    CHECK(fct_bitmap_load_file(&loaded, &meta, long_path) == 0 &&
+          fct_bitmap_completed(&loaded) == 4);
+    fct_bitmap_free(&loaded);
+    CHECK(unlink(long_path) == 0);
+
+    CHECK_FAILS(fct_bitmap_load_file(&loaded, &meta, dir), EPROTO);
+    CHECK_FAILS(fct_bitmap_load_file(&loaded, &meta, ""), EINVAL);
 
     char missing[96];
     snprintf(missing, sizeof(missing), "%s/none.bitmap", dir);
