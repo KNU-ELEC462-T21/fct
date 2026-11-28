@@ -10,7 +10,7 @@ Ubuntu 24.04 환경 기준으로 아래 명령을 실행합니다.
 
 ### 의존성 설치
 
-`sudo apt-get`으로 `gcc`, `clang-format`, `zlib1g-dev` 패키지를 설치합니다(표준 POSIX `pthread` 및 `zlib` 라이브러리 함께 링크).
+`sudo apt-get`으로 `gcc`, `clang-format`, `zlib1g-dev`, `libssl-dev` 패키지를 설치합니다(표준 POSIX `pthread`, `zlib` 및 `libcrypto` 라이브러리 함께 링크).
 
 ```sh
 make init

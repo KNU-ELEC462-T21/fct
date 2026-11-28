@@ -10,7 +10,7 @@ Run the commands below on Ubuntu 24.04.
 
 ### Install Dependencies
 
-Install `gcc`, `clang-format`, and `zlib1g-dev` via `sudo apt-get` (linked with standard POSIX `pthread` and `zlib` libraries).
+Install `gcc`, `clang-format`, `zlib1g-dev`, and `libssl-dev` via `sudo apt-get` (linked with standard POSIX `pthread`, `zlib`, and `libcrypto` libraries).
 
 ```sh
 make init

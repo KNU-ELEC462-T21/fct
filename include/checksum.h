@@ -7,15 +7,14 @@
 #include "common.h"
 
 typedef struct {
-    uint32_t state[8];
-    uint64_t bit_len;
-    uint8_t buffer[64];
-    size_t buffer_len;
+    void* evp;
 } fct_sha256_ctx_t;
 
 /* Compute IEEE CRC32 over data[0..len). Returns 0 when len is 0. */
 uint32_t fct_crc32(const void* data, size_t len);
 
+/* Every fct_sha256_init() call must be paired with fct_sha256_final() to
+ * release the underlying digest context. */
 void fct_sha256_init(fct_sha256_ctx_t* ctx);
 void fct_sha256_update(fct_sha256_ctx_t* ctx, const void* data, size_t len);
 void fct_sha256_final(fct_sha256_ctx_t* ctx, uint8_t out_digest[FCT_SHA256_SIZE]);
